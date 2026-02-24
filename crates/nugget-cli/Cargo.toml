@@ -1,0 +1,17 @@
+[package]
+name = "nugget-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nugget"
+path = "src/main.rs"
+
+[dependencies]
+nugget-core = { path = "../nugget-core" }
+nugget-store = { path = "../nugget-store" }
+nugget-inbox = { path = "../nugget-inbox" }
+nugget-mcp = { path = "../nugget-mcp" }
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+tokio = { workspace = true }
