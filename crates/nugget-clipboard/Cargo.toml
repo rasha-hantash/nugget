@@ -1,0 +1,21 @@
+[package]
+name = "nugget-clipboard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nugget-core = { path = "../nugget-core" }
+nugget-store = { path = "../nugget-store" }
+nugget-inbox = { path = "../nugget-inbox" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+arboard = "3"
+regex = "1"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
