@@ -1,0 +1,16 @@
+[package]
+name = "nugget-inbox"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nugget-core = { path = "../nugget-core" }
+nugget-store = { path = "../nugget-store" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
