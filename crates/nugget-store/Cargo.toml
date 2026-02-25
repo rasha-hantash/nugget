@@ -1,0 +1,15 @@
+[package]
+name = "nugget-store"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+nugget-core = { path = "../nugget-core" }
+walkdir = { workspace = true }
+serde_yaml_ng = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+tempfile = "3"
+chrono = { workspace = true }
