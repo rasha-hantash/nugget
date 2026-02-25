@@ -32,13 +32,13 @@ Nugget is an AI memory layer for Claude Code. Work with Claude Code -> knowledge
 - MCP tools depend on Claude remembering to call them ("Claude forgot" problem)
 - Session-end hooks are deterministic
 
-**Open question**: The exact hook mechanics are unresolved — does Claude Code support session-end hooks today? What event fires? How does the hook access the transcript file path? This is a hard blocker for the write path. See `DECISIONS.MD` for full details.
+**Verified**: Claude Code has a `SessionEnd` hook event. It receives `transcript_path`, `session_id`, `cwd`, and `reason` via stdin JSON. Supports `"async": true` for fire-and-forget. Configuration in `~/.claude/settings.json`.
 
 ### Decision: Post-session transcript analysis
 
 A background process reads the full session transcript (JSONL files stored by Claude Code) and sends it to an LLM for knowledge extraction. This ensures nothing is lost to compaction.
 
-**Open question**: The exact transcript file location and JSONL format need verification. Claude Code stores transcripts in `~/.claude/projects/` — path pattern and format are assumed, not confirmed. See `DECISIONS.MD` for full details.
+**Verified**: Transcripts at `~/.claude/projects/<project-path-with-dashes>/<session-uuid>.jsonl`. JSONL format with `user`, `assistant`, and tool-use message types. The `SessionEnd` hook provides `transcript_path` directly.
 
 ### Decision: Claude API for extraction
 
@@ -81,17 +81,23 @@ Claude Code calls one tool: `get_relevant_context(task_description)`. Nugget han
 - One tool call is simpler and more reliable than multi-step tool orchestration
 - Nugget can optimize retrieval internally without changing the API
 
-### Decision: Full 3-layer retrieval pipeline from MVP
+### Decision: Hybrid search + graph expansion + LLM re-ranking
 
-1. **Embedding search** — vector similarity
-2. **Graph expansion** — walk relationship edges
-3. **LLM re-ranking** — score for actual relevance
+The retrieval pipeline searches against **chunks** (derived from files), grouped/ranked at the **unit** level:
 
-**Why build all three from the start?**
+1. **Embedding search** on chunks — vector similarity (~50 chunks)
+2. **BM25/FTS5 search** on chunks — full-text match (~50 chunks)
+3. **RRF fusion** — combine embedding + BM25 via Reciprocal Rank Fusion, map to parent units
+4. **Graph expansion** — walk relationship edges on units, pull in chunks from related units
+5. **LLM re-ranking** — score chunks with unit context for actual relevance (top 5-10)
 
-- At small brain sizes, embeddings + LLM re-ranking carry the weight
-- Graph expansion kicks in progressively as the brain grows
-- Building incrementally was considered but rejected — the full pipeline works at every brain size
+**Why hybrid search (embeddings + BM25)?** BM25 catches exact terminology that embeddings miss. Proven in production RAG systems.
+
+**Why build all layers from the start?** The full pipeline works at every brain size. At small sizes, embeddings + re-ranking carry the weight. Graph expansion kicks in as the brain grows.
+
+### Decision: Markdown-aware chunking
+
+Knowledge units can be large (10+ pages). Files are chunked in the derived index, not on disk. Heading-based structural chunking with breadcrumb prepending — split at `##`/`###` boundaries, prepend heading path to each chunk before embedding (e.g., "Go Concurrency > Worker Pools"). Sub-split oversized sections at paragraph boundaries; merge tiny sections with siblings.
 
 ### Decision: Two entry points, same engine
 
@@ -112,10 +118,10 @@ Human-readable, Git-versionable, editable in any editor. Non-negotiable — the 
 
 ### Decision: SQLite derived index
 
-- Units table (id, path, title, type, domain, tags, confidence, source, created, last_modified)
-- Relationships table (source_id, target_id, relation_type)
-- FTS5 virtual table for full-text search
-- Embeddings table (id, vector)
+- **Units table**: id, path, title, type, domain, tags, confidence, source, created, last_modified, content
+- **Chunks table**: id, unit_id, content (with breadcrumb), heading_breadcrumb, heading_level, position, embedding
+- **Relationships table**: source_id, target_id, relation_type
+- **FTS5 virtual table**: full-text search over chunk content
 
 Rebuilt from files if corrupted or lost. Nothing is lost.
 

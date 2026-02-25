@@ -46,6 +46,43 @@ For the complete list of product decisions with full context, see `PRODUCT-DECIS
 
 **Resolution**: Read the full JSONL transcript file, not in-session context. Claude Code's compaction means in-session context may be missing earlier parts of the conversation. The transcript has everything.
 
+#### Claude Code hook mechanics — verified
+
+**Status**: RESOLVED
+
+**Context**: The write path depends entirely on Claude Code firing a hook when sessions end and providing the transcript path.
+
+**Resolution**: Verified. Claude Code has a `SessionEnd` hook event with exactly what we need:
+
+- Receives JSON via stdin: `transcript_path`, `session_id`, `cwd`, `reason`
+- `transcript_path` is the full absolute path to the JSONL transcript
+- Transcripts at `~/.claude/projects/<project-path-with-dashes>/<session-uuid>.jsonl`
+- JSONL format with `user`, `assistant`, and tool-use message types
+- Supports `"async": true` for fire-and-forget background processing
+- `SessionEnd` cannot block termination — runs as side effect only (exactly what we want)
+
+**Hook configuration** (`~/.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nugget capture-session",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook reads stdin JSON, extracts `transcript_path`, and spawns the capture pipeline.
+
 #### No clipboard capture in v1
 
 **Status**: RESOLVED — deferred to v2
@@ -130,17 +167,57 @@ For the complete list of product decisions with full context, see `PRODUCT-DECIS
 
 **Why**: The CLI is plumbing, not the product. The product is the automatic capture-and-retrieval loop.
 
+#### Markdown-aware chunking for retrieval
+
+**Status**: RESOLVED
+
+**Context**: Knowledge units can be large (10+ pages of markdown). A single embedding for a large document captures a blurry average rather than specific sections. We need to chunk files for the derived index while keeping whole files as the source of truth.
+
+**Resolution**: Heading-based structural chunking with breadcrumb prepending.
+
+1. Parse and strip YAML frontmatter (attach as metadata to all chunks)
+2. Split at markdown heading boundaries (`##`, `###`)
+3. Prepend heading breadcrumb to chunk text before embedding (e.g., "Go Concurrency > Worker Pools > Bounded")
+4. Size normalization: sub-split oversized sections (>512 tokens) at paragraph boundaries with 10-15% overlap; merge tiny sections (<50 tokens) with siblings
+5. No overlap between heading-level chunks (they're at natural semantic boundaries)
+
+**Why structural over fixed-size**: Markdown headings provide explicit semantic hierarchy. The structure is already there — no need to infer boundaries. Breadcrumb prepending ensures chunks carry their context in the vector space.
+
+**Rust implementation**: `pulldown-cmark` for markdown parsing + heading extraction; `text-splitter` crate's `MarkdownSplitter` for size-aware splitting; custom layer for breadcrumb injection and frontmatter handling.
+
+#### Hybrid search with RRF (embeddings + BM25/FTS5)
+
+**Status**: RESOLVED
+
+**Context**: Pure embedding search misses exact terminology matches. A query about "idempotency keys" might rank a semantically similar but wrong result above an exact match.
+
+**Resolution**: Combine embedding search and BM25 (SQLite FTS5) using Reciprocal Rank Fusion (RRF). Over-fetch from both methods, fuse with `score = 1/(k + rank)` where k=60, then pass fused results to graph expansion and LLM re-ranking.
+
+**Why**: BM25 catches exact terminology that embeddings miss. This pattern is proven in production RAG systems (see pdf-classaction-rag codebase for reference implementation).
+
+#### Chunk-based retrieval, unit-level ranking
+
+**Status**: RESOLVED
+
+**Resolution**: Search operates on chunks (embeddings + FTS5), but results are grouped and ranked at the unit level. If 3 chunks from the same knowledge unit match, that unit is highly relevant. Graph expansion still operates on unit-level relationships.
+
 ---
 
 ## Open Questions
 
-### 1. Claude Code hook mechanics
+### ~~1. Claude Code hook mechanics~~ RESOLVED
 
-**Priority**: BLOCKER for Phase 3
+**Status**: RESOLVED — moved to resolved decisions.
 
-Does Claude Code support session-end hooks? What event fires? How does the hook access the transcript file path? This is a hard technical dependency — need to verify feasibility before building the write path.
+Claude Code has a `SessionEnd` hook event. It receives `transcript_path`, `session_id`, `cwd`, and `reason` via stdin JSON. Hooks support `"async": true` for fire-and-forget. Configuration goes in `~/.claude/settings.json`. See resolved decision below for full details.
 
-### 2. Brain repo structure
+### ~~7. Transcript file discovery~~ RESOLVED
+
+**Status**: RESOLVED — verified on local machine.
+
+Transcripts live at `~/.claude/projects/<project-path-with-dashes>/<session-uuid>.jsonl`. The `SessionEnd` hook provides `transcript_path` directly — no discovery needed.
+
+### 2. Brain repo structure (renumbered from here)
 
 **Priority**: HIGH — needed for Phase 1
 

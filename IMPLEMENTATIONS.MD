@@ -34,8 +34,8 @@ nugget/
 | --- | --- | --- |
 | nugget-core | Types, serialization | serde, serde_yaml, chrono, uuid |
 | nugget-store | File I/O, brain directory ops | nugget-core, walkdir |
-| nugget-index | SQLite index, embeddings, rebuild | nugget-core, nugget-store, rusqlite, fastembed |
-| nugget-retrieve | 3-layer retrieval pipeline | nugget-index, reqwest (for LLM re-ranking) |
+| nugget-index | SQLite index, chunking, embeddings, rebuild | nugget-core, nugget-store, rusqlite, fastembed, pulldown-cmark, text-splitter |
+| nugget-retrieve | Hybrid search + graph + LLM re-ranking | nugget-index, reqwest (for LLM re-ranking) |
 | nugget-capture | Transcript analysis, LLM extraction, Git/PR | nugget-core, nugget-index, reqwest, git2 |
 | nugget-mcp | MCP server | nugget-retrieve, rmcp, tokio |
 | nugget-cli | CLI entry point | all crates, clap |
@@ -84,19 +84,25 @@ Build the entire read path so Claude Code can query the brain.
 
 - SQLite schema:
   - `units` table: id, path, title, type, domain, tags (JSON), confidence, source, created, last_modified, content
+  - `chunks` table: id (unit_id + chunk_index), unit_id, content (with breadcrumb), heading_breadcrumb, heading_level, position, embedding (BLOB)
   - `relationships` table: source_id, target_id, relation_type
-  - FTS5 virtual table over unit content and title
-  - `embeddings` table: id, vector (BLOB)
-- Build index from files: walk brain directory, parse each file, insert into SQLite
-- Generate embeddings: fastembed-rs (default) or API provider (configurable in brain.yaml)
-- Incremental update: reindex a single file by path
+  - `chunks_fts` FTS5 virtual table over chunk content
+- Markdown chunking pipeline:
+  - Parse heading tree (pulldown-cmark), split at heading boundaries
+  - Prepend heading breadcrumbs to chunk text before embedding
+  - Size normalization: sub-split >512 token chunks at paragraphs (10-15% overlap); merge <50 token chunks with siblings
+- Build index from files: walk brain directory, parse each file, chunk it, insert units + chunks into SQLite
+- Generate embeddings per chunk: fastembed-rs (default) or API provider (configurable in brain.yaml)
+- Incremental update: reindex a single file by path (delete old chunks, re-chunk, re-embed)
 - Rebuild: drop and recreate from files
 
 **nugget-retrieve** (`crates/nugget-retrieve/`)
 
-- Layer 1: Embedding search — embed query, cosine similarity against all stored vectors, return top ~50
-- Layer 2: Graph expansion — for top-20, walk 1-2 hops in relationships table, deduplicate, ~30 candidates
-- Layer 3: LLM re-ranking — send candidates + task description to Claude API, score relevance, return top 5-10
+- Layer 1a: Embedding search on chunks — cosine similarity, top ~50 chunks
+- Layer 1b: BM25/FTS5 search on chunks — full-text match, top ~50 chunks
+- Layer 1c: RRF fusion — combine embedding + BM25 results via `score = 1/(k + rank)` (k=60), map chunks to parent units
+- Layer 2: Graph expansion — for top units, walk 1-2 hops in relationships table, pull chunks from related units
+- Layer 3: LLM re-ranking — score chunks with unit context, return top 5-10 grouped by unit
 - Single entry point: `retrieve(task_description, index) -> Vec<RankedResult>`
 
 **nugget-mcp** (`crates/nugget-mcp/`)
@@ -210,7 +216,8 @@ _Hook integration:_
 | --- | --- | --- |
 | Language | Rust | Single binary, performance, ecosystem |
 | CLI | clap | Standard Rust CLI |
-| Markdown parsing | pulldown-cmark | Rust-native CommonMark |
+| Markdown parsing | pulldown-cmark | Rust-native CommonMark, heading tree extraction |
+| Markdown chunking | text-splitter | Semantic markdown splitting with size control |
 | YAML parsing | serde_yaml | Standard Rust YAML |
 | Database | SQLite (rusqlite) | Metadata, graph, FTS5, embedded |
 | Embeddings (default) | fastembed-rs | Local, CPU, offline, no API key |

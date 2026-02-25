@@ -113,11 +113,17 @@ CLAUDE.md or MCP server instructions tell Claude Code: "Always check the Nugget 
 
 ### Retrieval pipeline
 
-**Layer 1 — Embedding search.** Embed the task description, cosine similarity against all unit embeddings. Returns ~50 candidates.
+Search operates on **chunks** (derived from knowledge files), but results are grouped and ranked at the **unit** level.
 
-**Layer 2 — Graph expansion.** For top-20 results, walk 1-2 hops of relationship edges. Deduplicate. Surfaces prerequisites and related concepts that wouldn't match on text alone.
+**Layer 1a — Embedding search.** Embed the task description, cosine similarity against all chunk embeddings. Returns top ~50 chunks.
 
-**Layer 3 — LLM re-ranking.** Score remaining ~30 candidates for actual relevance to the specific task. Factors in confidence, freshness, source quality. Returns top 5-10, ranked.
+**Layer 1b — BM25/FTS5 search.** Full-text search against chunks via SQLite FTS5. Returns top ~50 chunks.
+
+**Layer 1c — RRF fusion.** Combine embedding and BM25 results using Reciprocal Rank Fusion: `score = 1/(k + rank)` where k=60. Produces ~30 fused chunk results. Map chunks to parent units.
+
+**Layer 2 — Graph expansion.** For top units from Layer 1c, walk 1-2 hops of relationship edges in the units graph. Pull in chunks from related units. ~40-50 total chunks.
+
+**Layer 3 — LLM re-ranking.** Score remaining chunks (with unit context) for actual relevance to the specific task. Factors in confidence, freshness, source quality. Returns top 5-10 chunks, grouped by unit.
 
 ### Entry points
 
@@ -182,12 +188,65 @@ brain/
     embeddings/                 # Vector embeddings
 ```
 
+### Markdown chunking
+
+Knowledge units can be large (10+ pages). A single embedding for a large document captures a blurry average. The index chunks files for search while keeping whole files as source of truth.
+
+**Chunking pipeline:**
+
+1. Parse and strip YAML frontmatter -> attach as metadata to all chunks
+2. Parse heading tree (`pulldown-cmark`)
+3. Split at heading boundaries (`##`, `###`)
+4. Size normalization:
+   - Chunks > 512 tokens: sub-split at paragraph boundaries, 10-15% overlap between sub-chunks
+   - Chunks < 50 tokens: merge with next sibling section
+5. Prepend heading breadcrumb to chunk text before embedding (e.g., "Go Concurrency > Worker Pools > Bounded")
+
+No overlap between heading-level chunks (natural semantic boundaries). Overlap only within sub-splits of oversized sections.
+
 ### Derived index (SQLite)
 
-- **Units table**: id, path, title, type, domain, tags, confidence, source, created, last_modified, content
-- **Relationships table**: source_id, target_id, relation_type
-- **FTS5 virtual table**: full-text search over unit content and title
-- **Embeddings table**: id, vector (configurable dimension)
+```sql
+-- One row per knowledge file
+CREATE TABLE units (
+    id TEXT PRIMARY KEY,
+    path TEXT,
+    title TEXT,
+    type TEXT,
+    domain TEXT,
+    tags TEXT,              -- JSON array
+    confidence REAL,
+    source TEXT,
+    created TEXT,
+    last_modified TEXT,
+    content TEXT             -- full markdown body (for display)
+);
+
+-- Chunks derived from units (for search)
+CREATE TABLE chunks (
+    id TEXT PRIMARY KEY,     -- unit_id + chunk_index
+    unit_id TEXT REFERENCES units(id),
+    content TEXT,            -- chunk text WITH breadcrumb prepended
+    heading_breadcrumb TEXT,
+    heading_level INTEGER,
+    position INTEGER,        -- sequential order within unit
+    embedding BLOB           -- vector
+);
+
+-- Graph edges between units
+CREATE TABLE relationships (
+    source_id TEXT,
+    target_id TEXT,
+    relation_type TEXT
+);
+
+-- FTS5 over chunks (not units)
+CREATE VIRTUAL TABLE chunks_fts USING fts5(
+    content,
+    unit_id UNINDEXED,
+    chunk_id UNINDEXED
+);
+```
 
 Rebuilt from files on startup. If corrupted or lost, rebuild. Nothing is lost.
 
@@ -263,21 +322,20 @@ nugget/
 
 **nugget-index** (`crates/nugget-index/`)
 
-- SQLite schema:
-  - `units` table: id, path, title, type, domain, tags (JSON), confidence, source, created, last_modified, content
-  - `relationships` table: source_id, target_id, relation_type
-  - FTS5 virtual table over unit content and title
-  - `embeddings` table: id, vector (BLOB)
-- Build index from files: walk brain directory, parse each file, insert into SQLite
-- Generate embeddings: fastembed-rs (default) or API provider (configurable)
-- Incremental update: reindex a single file by path
-- Rebuild: drop and recreate from files
+- SQLite schema: units table, chunks table, relationships table, chunks_fts (FTS5). See schema in Storage section above.
+- Markdown chunking: parse heading tree, split at heading boundaries, prepend breadcrumbs, size-normalize
+- Build index from files: walk brain directory, parse each file, chunk it, insert units + chunks into SQLite
+- Generate embeddings per chunk: fastembed-rs (default) or API provider (configurable)
+- Incremental update: reindex a single file by path (delete old chunks, re-chunk, re-embed)
+- Rebuild: drop and recreate everything from files
 
 **nugget-retrieve** (`crates/nugget-retrieve/`)
 
-- Layer 1: Embedding search — embed query, cosine similarity against all stored vectors, return top ~50
-- Layer 2: Graph expansion — for top-20, walk 1-2 hops in relationships table, deduplicate, ~30 candidates
-- Layer 3: LLM re-ranking — send candidates + task description to Claude API, score relevance, return top 5-10
+- Layer 1a: Embedding search on chunks — cosine similarity, top ~50 chunks
+- Layer 1b: BM25/FTS5 search on chunks — full-text match, top ~50 chunks
+- Layer 1c: RRF fusion — combine embedding + BM25 results, `score = 1/(k + rank)`, map chunks to parent units
+- Layer 2: Graph expansion — for top units, walk 1-2 hops in relationships table, pull chunks from related units
+- Layer 3: LLM re-ranking — score chunks with unit context, return top 5-10 grouped by unit
 - Single entry point: `retrieve(task_description, index) -> Vec<RankedResult>`
 
 **nugget-mcp** (`crates/nugget-mcp/`)
@@ -349,35 +407,36 @@ _Hook integration:_
 
 ## Open Questions (to resolve during implementation)
 
-1. **Claude Code hook mechanics**: Does Claude Code support session-end hooks? What event fires? How does the hook access the transcript file path?
+1. ~~**Claude Code hook mechanics**~~: RESOLVED. `SessionEnd` hook provides `transcript_path` via stdin JSON. See `DECISIONS.MD`.
 2. **Brain repo structure**: Exact directory layout — flat domains at top level? Nested types within domains? File naming conventions?
 3. **PR format**: Exact PR title/description/commit message format?
 4. **Capture agent packaging**: Part of the `nugget` binary (`nugget capture-session`)? Separate binary?
 5. **Relationship detection**: How does the capture agent identify relationships to existing knowledge? Requires index to exist before capture works well.
 6. **Conflict resolution**: What happens if a PR modifies an existing knowledge file updated on main since the branch was created?
-7. **Transcript file discovery**: Exact path and JSONL format of Claude Code session transcripts.
+7. ~~**Transcript file discovery**~~: RESOLVED. Transcripts at `~/.claude/projects/<project-path-with-dashes>/<session-uuid>.jsonl`. Hook provides path directly.
 8. **Multiple sessions in flight**: Race conditions if two sessions end simultaneously. Unique branch names help but need verification.
 
 ---
 
 ## Tech Stack
 
-| Component             | Choice               | Why                                     |
-| --------------------- | -------------------- | --------------------------------------- |
-| Language              | Rust                 | Single binary, performance, ecosystem   |
-| CLI                   | clap                 | Standard Rust CLI                       |
-| Markdown parsing      | pulldown-cmark       | Rust-native CommonMark                  |
-| YAML parsing          | serde_yaml           | Standard Rust YAML                      |
-| Database              | SQLite (rusqlite)    | Metadata, graph, FTS5, embedded         |
-| Embeddings (default)  | fastembed-rs         | Local, CPU, offline, no API key         |
-| Embeddings (optional) | OpenAI / Voyage API  | Higher quality, requires API key        |
-| LLM (extraction)      | Claude API (reqwest) | Knowledge extraction from transcripts   |
-| LLM (re-ranking)      | Claude API (reqwest) | Relevance scoring in retrieval pipeline |
-| MCP server            | rmcp                 | Rust MCP SDK                            |
-| Git operations        | git2 or shell git    | Branch/commit/push for PR creation      |
-| GitHub PRs            | gh CLI or GitHub API | PR creation                             |
-| Async runtime         | tokio                | Standard Rust async                     |
-| File walking          | walkdir              | Brain directory traversal               |
+| Component             | Choice               | Why                                             |
+| --------------------- | -------------------- | ----------------------------------------------- |
+| Language              | Rust                 | Single binary, performance, ecosystem           |
+| CLI                   | clap                 | Standard Rust CLI                               |
+| Markdown parsing      | pulldown-cmark       | Rust-native CommonMark, heading tree extraction |
+| Markdown chunking     | text-splitter        | Semantic markdown splitting with size control   |
+| YAML parsing          | serde_yaml           | Standard Rust YAML                              |
+| Database              | SQLite (rusqlite)    | Metadata, graph, FTS5, embedded                 |
+| Embeddings (default)  | fastembed-rs         | Local, CPU, offline, no API key                 |
+| Embeddings (optional) | OpenAI / Voyage API  | Higher quality, requires API key                |
+| LLM (extraction)      | Claude API (reqwest) | Knowledge extraction from transcripts           |
+| LLM (re-ranking)      | Claude API (reqwest) | Relevance scoring in retrieval pipeline         |
+| MCP server            | rmcp                 | Rust MCP SDK                                    |
+| Git operations        | git2 or shell git    | Branch/commit/push for PR creation              |
+| GitHub PRs            | gh CLI or GitHub API | PR creation                                     |
+| Async runtime         | tokio                | Standard Rust async                             |
+| File walking          | walkdir              | Brain directory traversal                       |
 
 ---
 
