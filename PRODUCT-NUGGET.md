@@ -1,56 +1,72 @@
 # Nugget
 
-**A personal knowledge brain that AI agents can read and write to.**
+**An AI memory layer for Claude Code.**
 
 ---
 
 ## What is it?
 
-Nugget is where you store how you think. It's a collection of markdown files — concepts you understand, patterns you use, decisions you've made, bugs you've fixed — organized by domain, versioned with Git, and queryable by AI.
+Nugget automatically extracts knowledge from your Claude Code sessions and makes it available for future sessions. It's a collection of markdown files — patterns you use, decisions you've made, bugs you've fixed, concepts you understand — organized by domain, versioned with Git, and queryable by AI.
 
-When you connect Nugget to Claude Code (or any AI tool), the AI stops giving you generic answers and starts giving you answers informed by _your_ knowledge, _your_ team's conventions, and _your_ past decisions.
-
-When you connect to a colleague's brain, you can browse what they know and cherry-pick the knowledge that's useful to you — without needing to schedule a meeting.
+When Nugget is connected to Claude Code, the AI stops giving you generic answers and starts giving you answers informed by _your_ knowledge, _your_ conventions, and _your_ past decisions.
 
 ---
 
 ## Who is it for?
 
-- **Individual developers** who want their AI tools to know their preferences, patterns, and past decisions
-- **Engineers learning from senior peers** who want async access to how smart people think
-- **Teams** who want to share institutional knowledge without it living in someone's head
-- **Anyone** who accumulates knowledge across domains (coding, fashion, management, hobbies) and wants it organized and searchable
+**Individual developers using Claude Code** who want their AI assistant to remember what they've learned across sessions.
+
+V1 is laser-focused on this user. Team features, other AI tools, and non-developers are future expansion.
 
 ---
 
 ## The Core Problem
 
-Tacit knowledge requires synchronous experience to acquire. When a senior engineer helps you debug a race condition, you absorb how they think: what they check first, what they suspect, how they narrow down. That mental model transfer only happens in the moment, and it's lost the second the conversation ends.
+Every Claude Code session starts from zero. You teach Claude how you think, what conventions you follow, what you've tried before — and then the session ends and all of that knowledge vanishes. The next session, you start over.
 
-Nugget makes that transfer async.
+Nugget makes that knowledge persist.
 
 ---
 
 ## How It Works
 
-### Your brain is a folder of files
+### The flywheel
+
+```
+You work with Claude Code → session ends
+    ↓
+Nugget reads the session transcript → extracts knowledge
+    ↓
+Opens a PR in your brain repo → you review and merge
+    ↓
+Next session, Claude Code queries your brain → gives better answers
+    ↓
+You work better → more knowledge captured → ...
+```
+
+The more you use Claude Code with Nugget, the smarter it gets. The knowledge compounds.
+
+### Your brain is a Git repo
+
+A dedicated GitHub repo (e.g., `github.com/you/brain`) containing markdown files organized by domain:
 
 ```
 brain/
+  brain.yaml                          # Brain metadata and config
   domains/
     coding/
       concepts/cache-invalidation.md
       patterns/retry-with-idempotency.md
-      decisions/2024-01-15-redis-for-sessions.md
-    fashion/
-      concepts/capsule-wardrobe.md
-      patterns/seasonal-rotation.md
+      decisions/redis-for-sessions.md
+    coding/go/
+      patterns/error-handling.md
+    coding/rust/
+      concepts/ownership-patterns.md
     management/
       patterns/one-on-one-framework.md
-  identity/
-    voice.md          # How you communicate
-    beliefs.yaml      # What you believe
-  inbox/              # New knowledge waiting for your review
+  .nugget/                            # Gitignored — derived state
+    index.db                          # SQLite: metadata + graph + FTS5
+    embeddings/                       # Vector embeddings for search
 ```
 
 Each file is a knowledge unit with structured metadata:
@@ -61,10 +77,12 @@ type: pattern
 domain: coding
 tags: [stripe, payments, reliability]
 confidence: 0.9
-source: experience
+source: ai-session
 related:
   - id: concept/idempotency-keys
     relation: uses
+created: 2026-02-24
+last_modified: 2026-02-24
 ---
 
 # Retry with Idempotency Keys
@@ -74,112 +92,62 @@ When retrying Stripe API calls, ALWAYS use idempotency keys...
 
 Files encode a knowledge graph through their relationships. Nugget indexes this into a searchable, traversable structure. But the files are always the source of truth — human-readable, Git-versioned, editable in any tool.
 
-### Domains keep things organized
+### Organization is agent-managed
 
-Domains are top-level folders that act as namespaces. Think of them like separate notebooks.
+You never manually organize your brain. The capture agent decides:
 
-- **Scoped search**: Search just your coding knowledge, or across everything
-- **Sharing boundaries**: Share your coding brain without exposing your fashion knowledge
-- **Natural routing**: When AI captures knowledge, it suggests which domain it belongs to
-- **Cross-domain links**: A concept in coding/ can link to one in management/. The graph doesn't care about folder boundaries.
+- Which domain folder to place each file in
+- What type it is (pattern, concept, decision, bug, belief)
+- What tags to apply
+- What relationships to create (links to existing knowledge)
+- Confidence level and filename
 
-You create domains as you need them. There's no fixed taxonomy.
-
-### Everything flows through the inbox
-
-Every piece of captured knowledge — from a URL, a conversation, an observation, or a manual entry — lands in the **inbox**. Nothing auto-accepts. You review everything.
-
-```
-$ nugget inbox
-  Inbox: 12 items (7 coding, 3 fashion, 2 unclassified)
-
-  1. [coding]  Distributed Locking Comparison    (from: URL, 10:30am)
-  2. [coding]  Stripe Webhook Retry Patterns      (from: pairing w/ Sarah, 11:00am)
-  3. [fashion] Summer 2024 Linen Layering         (from: URL, 12:15pm)
-```
-
-Review is fast. Most items need a 2-second glance: accept or reject. Bulk-accept a batch with `nugget accept 1-7`. The AI already did the extraction work — you're just triaging.
+You can always browse the brain repo — it's just folders and markdown files — but you don't need to manage it.
 
 ---
 
-## Six Ways Knowledge Gets Into Your Brain
+## How Knowledge Gets In
 
-### 1. Web capture
+### Primary: Automatic session capture
 
-You're browsing the web and find something worth remembering.
+Every Claude Code session is automatically captured. When a session ends:
 
-```
-$ nugget capture --url "https://blog.example.com/distributed-locking"
+1. A session-end hook fires
+2. A background process reads the full session transcript (JSONL)
+3. Sends it to an LLM for knowledge extraction
+4. Extracts reusable patterns, architectural decisions, domain knowledge, debugging insights
+5. Creates a branch in your brain repo
+6. Commits proposed knowledge files to appropriate domain directories
+7. Opens a GitHub PR
 
-  Added to inbox: "Distributed Locking Comparison" (coding)
-```
+You review the PR in GitHub — the UI you already use. Comment, edit, approve, merge. Merged knowledge is in your brain for the next session.
 
-Background agent fetches the page, extracts the key knowledge, suggests a domain and tags. You review it later.
+**Why PRs instead of an inbox?** PRs are a review model developers use daily. No new workflow to learn, no custom UI to build, and PR abandonment is more visible than inbox abandonment.
 
-### 2. Post-session capture
+**Why post-session transcript analysis?** Claude Code compresses earlier messages during long sessions. By reading the full transcript file, nothing is lost.
 
-After a pairing session or debugging call, paste your notes.
+### Future capture mechanisms (v2+)
 
-```
-$ nugget capture --from-text --source "pairing with Sarah" < notes.md
-
-  Added to inbox:
-    1. "Flaky Payment Test Diagnosis" (pattern)
-    2. "Stripe Webhook Mock Behavior" (concept)
-    3. "Stripe Client Retry Bug" (bug)
-```
-
-AI breaks your raw notes into atomic knowledge units, each with suggested domain, tags, and relationships to your existing knowledge.
-
-### 3. AI conversation capture
-
-After a Claude Code session, the AI captures what was learned and sends it to your inbox.
-
-### 4. Continuous observation
-
-Nugget watches your Git commits. When it notices patterns (e.g., "you've fixed the same kind of bug 3 times this month"), it suggests a knowledge unit.
-
-### 5. Interview mode
-
-Nugget asks you questions to extract your tacit knowledge.
-
-```
-$ nugget interview --topic "how I debug production issues"
-
-  Q: "When you get paged, what's the first thing you check?"
-  A: "Error rate dashboard, then recent deploys..."
-
-  Added to inbox: "Production Incident Triage" (pattern)
-```
-
-### 6. Cross-brain cherry-pick
-
-Add a colleague's brain as a Git remote. Browse what they know. Pull what's useful.
-
-```
-$ nugget remote add sarah git@github.com:sarah/brain.git
-$ nugget diff sarah --domain coding
-
-  32 units in Sarah's coding brain that aren't in yours:
-    1. pattern/circuit-breaker-tuning
-    2. concept/stripe-idempotency-keys
-    ...
-
-$ nugget pull sarah concept/stripe-idempotency-keys
-  Added to inbox.
-```
+- **Import existing docs** — seed the brain from CLAUDE.md files, project docs, notes
+- **Interview mode** — Nugget asks you questions to extract tacit knowledge
+- **Clipboard capture** — background URL monitoring
+- **Cross-brain cherry-pick** — pull knowledge from colleagues' brains
 
 ---
 
-## How AI Gets the Right Knowledge
+## How Claude Code Uses Your Knowledge
 
-When Claude Code is helping you with a Rust caching problem, you don't want it pulling your fashion knowledge. Nugget uses a three-layer retrieval pipeline:
+### Single MCP tool
+
+Claude Code calls one tool: `get_relevant_context(task_description)`. Nugget handles all the intelligence internally — keyword extraction, embedding search, graph traversal, relevance ranking. Claude Code's only job is to call the tool and use the results.
+
+### Three-layer retrieval pipeline
 
 **Layer 1 — Similarity search.** Find the ~50 knowledge units most semantically similar to the current task. Fast but imprecise.
 
 **Layer 2 — Graph expansion.** For the top results, walk their relationship links. Your `cache-invalidation` concept links to `ttl-strategy` pattern and `redis-choice` decision. Those wouldn't have matched on text alone but are exactly what you need.
 
-**Layer 3 — Relevance ranking.** A fast LLM scores the remaining candidates for actual relevance to the specific task. Filters out false positives. Factors in confidence, freshness, and source quality.
+**Layer 3 — Relevance ranking.** An LLM scores the remaining candidates for actual relevance to the specific task. Filters out false positives. Factors in confidence, freshness, and source quality.
 
 The result: the 5-10 most relevant pieces of YOUR knowledge, ranked from most to least useful.
 
@@ -189,51 +157,61 @@ Domain context helps too. When you're working in a coding context, coding knowle
 
 ## How You Interact With It
 
-**CLI** — for managing your brain directly.
+### CLI (minimal)
 
-- `nugget init` / `nugget domain add coding`
-- `nugget capture --url "..."` / `nugget capture --from-text`
-- `nugget inbox` / `nugget review` / `nugget accept 1 2 3`
-- `nugget search "cache invalidation" --domain coding`
-- `nugget remote add sarah ...` / `nugget diff sarah` / `nugget pull sarah ...`
+- `nugget init` — one-time brain repo setup
+- `nugget serve` — start the MCP server for Claude Code
+- `nugget ask "cache invalidation strategies"` — direct brain query from the terminal
 
-**MCP server** — for AI agents.
+### Claude Code MCP
 
-- Claude Code, PR Reviewer, or any MCP-compatible tool can search your brain and capture new knowledge
-- Connect it once, and your AI tools automatically have access to your knowledge
+Add Nugget to your Claude Code config:
 
-**Your editor** — for direct editing.
+```json
+{
+  "mcpServers": {
+    "nugget": {
+      "command": "nugget",
+      "args": ["serve", "--brain", "~/brain"]
+    }
+  }
+}
+```
 
-- Knowledge files are just markdown. Open them in VS Code, Obsidian, or any text editor.
+Claude Code automatically queries your brain for relevant context before answering.
 
-**Git** — for sharing and collaboration.
+### Your editor
 
-- Push your brain to GitHub. Others pull it. Standard workflows.
+Knowledge files are just markdown. Open them in VS Code, Obsidian, or any text editor.
+
+### GitHub
+
+PRs for review. Browse your brain repo on GitHub. Standard Git workflows.
 
 ---
 
 ## What Makes It Different
 
-| Other tools                                           | Nugget                                                        |
-| ----------------------------------------------------- | ------------------------------------------------------------- |
-| Notion/Obsidian are for humans to read                | Nugget is for both humans AND AI agents to read               |
-| Note-taking apps require you to organize as you write | AI extracts and organizes for you; you just approve           |
-| Knowledge bases are write-once, read-never            | Nugget's retrieval pipeline makes knowledge actually get used |
-| Tribal knowledge stays in people's heads              | Nugget makes it browsable, shareable, and cherry-pickable     |
-| AI tools use generic training data                    | AI tools connected to Nugget use YOUR knowledge               |
+| Other tools                                           | Nugget                                                      |
+| ----------------------------------------------------- | ----------------------------------------------------------- |
+| Claude Code starts every session from zero            | Nugget carries knowledge across sessions                    |
+| CLAUDE.md is manual and project-scoped                | Nugget captures automatically and works across all projects |
+| Note-taking apps require you to organize as you write | AI extracts and organizes for you; you just review PRs      |
+| Knowledge bases are write-once, read-never            | Three-layer retrieval makes knowledge actually get used     |
+| AI tools use generic training data                    | AI tools connected to Nugget use YOUR knowledge             |
 
 ---
 
-## The Flywheel
+## Privacy
 
-```
-You work → AI observes → knowledge captured to inbox
-    ↓
-You review inbox → knowledge enters your brain
-    ↓
-AI uses your knowledge → gives better answers
-    ↓
-You work better → AI observes more → ...
-```
+Session transcripts are sent to the Claude API for knowledge extraction. This is the same trust boundary as using Claude Code itself — your code is already going through Claude.
 
-The more you use Nugget, the smarter your AI tools become. The smarter they become, the more useful knowledge they capture. The knowledge compounds.
+---
+
+## The Vision
+
+Today: Claude Code is smarter because it knows what you know.
+
+Tomorrow: import your existing docs, interview mode to extract tacit knowledge, share brains with colleagues, team knowledge that compounds.
+
+The personal tool is the foundation. Everything else builds on top.

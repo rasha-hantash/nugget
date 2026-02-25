@@ -2,222 +2,230 @@
 
 ## Context
 
-Nugget is a personal knowledge brain — a Git-versioned collection of markdown files that AI agents can read and write to. The core problem: making it **incredibly easy** for people to add their knowledge without manual effort.
+Nugget is an AI memory layer for Claude Code. It automatically extracts knowledge from Claude Code sessions and makes it available for future sessions via MCP.
 
-Two capture mechanisms emerged as priorities:
+**Architecture summary:**
 
-1. **Clipboard capture** — a background listener that detects URLs (and optionally prose) copied to the clipboard and proposes them to the inbox. No code blocks — those aren't knowledge; the _workflow_ of solving a problem is.
-2. **AI session capture** — Claude Code (and eventually Claude co-work) pushes learnings to your inbox after helping you. Zero friction — the AI was already there, it saw what happened.
+- **Write path**: Session-end hook -> transcript analysis -> LLM extraction -> GitHub PR
+- **Read path**: Single MCP tool (`get_relevant_context`) -> 3-layer retrieval pipeline
+- **Storage**: Markdown files (source of truth) + SQLite derived index (metadata, graph, FTS5, embeddings)
+- **CLI**: `nugget init`, `nugget serve`, `nugget ask "..."`, `nugget capture-session`
 
-Both are opt-in. Both produce inbox items in the same format. Both can be built in parallel after a thin shared foundation.
+---
+
+## Crate Structure
+
+```
+nugget/
+  Cargo.toml                    # Workspace root
+  crates/
+    nugget-core/                # Core types
+    nugget-store/               # File parser/writer, brain directory ops
+    nugget-index/               # SQLite + FTS5 + embeddings
+    nugget-retrieve/            # 3-layer retrieval pipeline
+    nugget-capture/             # Transcript analysis, LLM extraction, Git/PR ops
+    nugget-mcp/                 # MCP server (single tool)
+    nugget-cli/                 # CLI entry point
+```
+
+### What each crate owns
+
+| Crate | Responsibility | Depends on |
+| --- | --- | --- |
+| nugget-core | Types, serialization | serde, serde_yaml, chrono, uuid |
+| nugget-store | File I/O, brain directory ops | nugget-core, walkdir |
+| nugget-index | SQLite index, embeddings, rebuild | nugget-core, nugget-store, rusqlite, fastembed |
+| nugget-retrieve | 3-layer retrieval pipeline | nugget-index, reqwest (for LLM re-ranking) |
+| nugget-capture | Transcript analysis, LLM extraction, Git/PR | nugget-core, nugget-index, reqwest, git2 |
+| nugget-mcp | MCP server | nugget-retrieve, rmcp, tokio |
+| nugget-cli | CLI entry point | all crates, clap |
 
 ---
 
 ## Build Order
 
-### Phase 0: Shared Foundation (sequential, do first) -- DONE
+### Phase 1: Foundation
 
-Build the minimal shared types and inbox infrastructure that both workstreams depend on.
+Build the core types, file I/O, and basic CLI.
 
 **nugget-core** (`crates/nugget-core/`)
 
-- `KnowledgeUnit` struct: id, type, domain, tags, confidence, source, related, body
-- `InboxItem` struct: extends KnowledgeUnit with `suggested_domain`, `suggested_path`, `captured_at`, `capture_method`, `capture_context`
-- `KnowledgeType` enum: concept, pattern, decision, bug, belief
-- `CaptureMethod` enum: clipboard-url, clipboard-text, ai-session, web-capture, manual
+- `KnowledgeUnit` struct: id, type, domain, tags, confidence, source, related, body, created, last_modified
+- `KnowledgeType` enum: pattern, concept, decision, bug, belief
+- `RelationType` enum: uses, implements, requires_understanding_of, informed_by, often_combined_with
 - `Domain`, `Tag`, `Confidence`, `Relation` types
 - Frontmatter serialization/deserialization (serde + serde_yaml)
 
 **nugget-store** (`crates/nugget-store/`)
 
-- Brain directory operations: `init` (create brain/ structure), `domain add`
-- Markdown + YAML frontmatter parser/writer (serde_yaml)
+- Brain directory operations: `init` (create brain/ structure with brain.yaml and domains/)
+- Markdown + YAML frontmatter parser/writer (handle the `---` delimiter correctly — only first pair is frontmatter)
 - Read/write knowledge files to disk
+- Walk brain directory, collect all knowledge file paths
+- List domains
 
-**nugget-inbox** (`crates/nugget-inbox/`)
+**nugget-cli** (`crates/nugget-cli/`)
 
-- Write inbox items to `brain/inbox/` with timestamped filenames
-- List inbox items (parse all files in inbox/)
-- Accept: move from inbox/ to domain path, strip inbox-specific fields
-- Reject: delete from inbox
-- Batch operations: accept/reject multiple by index
+- `nugget init [--path <dir>]` — create brain directory
 
-**nugget-cli** (`crates/nugget-cli/`) — minimal
+**Key deps**: serde, serde_yaml, chrono, uuid, walkdir, clap
 
-- `nugget init` — create brain directory
-- `nugget domain add <name>` — create domain folder + domain.yaml
-- `nugget domain list` — list all domains
-- `nugget inbox` — list pending items
-- `nugget accept <indices>` / `nugget reject <indices>`
-- `nugget review` — interactive one-by-one review
+**Deliverable**: `nugget init` creates a correct brain directory. Knowledge files parse and round-trip correctly (parse -> serialize -> parse = identical). Unit tests with insta snapshots.
 
-**Status**: All 4 crates built, compiling, 7 tests passing, clippy clean.
+**Note**: Previous Phase 0 code exists (nugget-core, nugget-store, nugget-inbox, nugget-cli) but the architecture has changed significantly. nugget-inbox is no longer needed (replaced by GitHub PRs). nugget-core and nugget-store may be partially reusable but need review against the new data model.
 
 ---
 
-### Phase 1A: Clipboard Capture (parallel workstream)
+### Phase 2: Read Path (Index + Retrieval + MCP)
 
-A background daemon that watches the macOS clipboard and proposes URLs to the inbox.
+Build the entire read path so Claude Code can query the brain.
 
-**nugget-clipboard** (`crates/nugget-clipboard/`)
+**nugget-index** (`crates/nugget-index/`)
 
-- macOS pasteboard polling (using `arboard` crate)
-- Poll interval: ~500ms–1s
-- Change detection: only act when clipboard content changes
+- SQLite schema:
+  - `units` table: id, path, title, type, domain, tags (JSON), confidence, source, created, last_modified, content
+  - `relationships` table: source_id, target_id, relation_type
+  - FTS5 virtual table over unit content and title
+  - `embeddings` table: id, vector (BLOB)
+- Build index from files: walk brain directory, parse each file, insert into SQLite
+- Generate embeddings: fastembed-rs (default) or API provider (configurable in brain.yaml)
+- Incremental update: reindex a single file by path
+- Rebuild: drop and recreate from files
 
-**Heuristic filter pipeline:**
+**nugget-retrieve** (`crates/nugget-retrieve/`)
 
-1. **Type detection**: is this a URL, prose, code, or junk?
-   - URL regex match → proceed
-   - Code detection (indentation patterns, syntax keywords, brackets density) → **drop** (per design decision: code blocks aren't knowledge)
-   - Short strings (< 20 chars) → drop
-   - Looks like a password/token (high entropy, no spaces) → drop
-2. **URL filtering:**
-   - Ignore common non-knowledge URLs: localhost, google.com, github.com/settings, mail.google.com, etc.
-   - Allow: blog posts, documentation, Stack Overflow, articles, tech sites
-   - Special case: `claude.ai/chat/*` URLs → flag for richer extraction (future: Claude co-work capture)
-3. **Dedup**: skip if this exact URL was captured in the last 24h
-4. **Propose**: write an InboxItem to `brain/inbox/` with `capture_method: clipboard-url`
-
-**For the MVP, URL-only capture.** Prose detection is a future enhancement — the SNR is too low without more context about what app the user copied from.
-
-**Daemon lifecycle:**
-
-- `start()` — start monitoring in background, write PID to `brain/.nugget/clipboard.pid`
-- `stop()` — read PID file, send SIGTERM
-- `status()` — check if PID is alive
-- `run()` — run in foreground (for development/debugging)
-
-**Config** in `brain.yaml`:
-
-```yaml
-clipboard:
-  enabled: true
-  capture_urls: true
-  capture_text: false # opt-in later
-  poll_interval_ms: 500
-  ignore_domains:
-    - localhost
-    - mail.google.com
-    - accounts.google.com
-```
-
-**CLI integration:**
-
-- `nugget daemon start` — start the clipboard listener in background
-- `nugget daemon stop` — stop it
-- `nugget daemon status` — is it running?
-- `nugget daemon run` — run in foreground
-
-**Key dependencies:** nugget-core, nugget-inbox, nugget-store, arboard, regex
-
----
-
-### Phase 1B: AI Session Capture (parallel workstream)
-
-An MCP server that Claude Code (and other AI tools) can call to push learnings to your inbox.
-
-**nugget-capture** (`crates/nugget-capture/`)
-
-- `capture_from_conversation(summary, learnings, decisions, context)`:
-  - Each learning → separate InboxItem of type `pattern` or `concept`
-  - Each decision → separate InboxItem of type `decision`
-  - `capture_method: ai-session`
-  - `confidence: 0.7` (AI-observed, not yet user-validated)
-  - Suggested domain based on context (e.g., if working in a Rust project → `coding/rust`)
-- `capture_from_url(url, title, summary, tags)`:
-  - Create an InboxItem with the URL as source, title as first line of body, summary as body
-  - `capture_method: web-capture`
-  - For MVP, accept pre-processed data (the MCP tool caller does the extraction)
-- `capture_from_text(text, source, suggested_domain)`:
-  - Create an InboxItem from raw text
-  - `capture_method: manual`
-  - For MVP, treat the text as a single knowledge unit (skip LLM splitting)
+- Layer 1: Embedding search — embed query, cosine similarity against all stored vectors, return top ~50
+- Layer 2: Graph expansion — for top-20, walk 1-2 hops in relationships table, deduplicate, ~30 candidates
+- Layer 3: LLM re-ranking — send candidates + task description to Claude API, score relevance, return top 5-10
+- Single entry point: `retrieve(task_description, index) -> Vec<RankedResult>`
 
 **nugget-mcp** (`crates/nugget-mcp/`)
 
-- MCP server using `rmcp` crate (Rust MCP SDK)
-- Expose tools:
-  - `capture_learnings` — post-session knowledge push (summary, learnings[], decisions[], context?)
-  - `capture_url` — URL-based capture (url, title, summary, tags?, domain?)
-  - `capture_text` — raw text capture (text, source?, domain?)
-  - `inbox_status` — how many items pending, recent items preview
-- Entry point: `nugget mcp --brain ~/brain`
-- Uses stdio transport (stdin/stdout for Claude Code communication)
-- Claude Code config:
-  ```json
-  {
-    "mcpServers": {
-      "nugget": {
-        "command": "nugget",
-        "args": ["mcp", "--brain", "~/brain"]
-      }
-    }
-  }
-  ```
+- MCP server using rmcp (Rust MCP SDK)
+- Single tool: `get_relevant_context(task_description: string) -> ranked knowledge units`
+- Server instructions: "You have access to the user's personal knowledge brain via Nugget. Always check the brain for relevant context before answering questions."
+- Entry point: `nugget serve` (stdio transport for Claude Code)
 
-**Key dependencies:** nugget-core, nugget-inbox, nugget-store, rmcp, tokio, serde_json
+**nugget-cli** additions:
+
+- `nugget serve` — start MCP server
+- `nugget ask "..."` — query the brain from terminal (retrieval pipeline + LLM formats answer)
+
+**Key deps**: rusqlite, fastembed, rmcp, tokio, reqwest (for Claude API)
+
+**Deliverable**: Manually populate a brain with ~20 knowledge files across 2-3 domains. `nugget ask "how to handle retries"` returns relevant results. Configure Claude Code MCP -> ask a domain question -> Claude Code calls `get_relevant_context` -> gets relevant knowledge -> uses it in response.
 
 ---
 
-### Phase 2: Search & Retrieval (after both workstreams converge)
+### Phase 3: Write Path (Session Capture + PRs)
 
-Make the captured knowledge actually useful.
+Build automatic knowledge capture from Claude Code sessions.
 
-- **nugget-index**: SQLite metadata store + tantivy full-text search
-- **nugget-retrieve**: basic 2-layer retrieval (embedding search + full-text, skip LLM reranking for MVP)
-- **nugget-mcp**: add `search_knowledge` and `get_knowledge` tools
-- **nugget-cli**: `nugget search "query" --domain coding`
+**nugget-capture** (`crates/nugget-capture/`)
 
-This is when the full loop closes: Claude Code captures knowledge → user reviews inbox → knowledge enters brain → Claude Code retrieves it next session.
+_Transcript handling:_
 
----
+- Discover transcript: locate Claude Code session transcript files (JSONL) in `~/.claude/projects/`
+- Parse JSONL: reconstruct conversation (human messages, assistant messages, tool calls)
+- Handle large transcripts: chunk if needed for LLM context window
 
-## What each parallel agent needs to know
+_LLM extraction:_
 
-### Agent A: Clipboard Capture
+- Extraction prompt: send transcript to Claude API with structured extraction instructions
+- Output: list of knowledge units (type, domain, tags, confidence, title, body, suggested relationships)
+- Relationship detection: load existing brain index, pass existing unit summaries to LLM so it can identify links
+- **Cold-start note**: First capture with an empty brain index = no relationships detected. Relationships improve as the brain grows.
 
-- Owns: `crates/nugget-clipboard/`
-- Depends on: nugget-core (types), nugget-inbox (write items), nugget-store (brain path)
-- Focus: macOS clipboard polling, URL detection, heuristic filtering, daemon lifecycle
-- Does NOT need: LLM calls, MCP, network fetching
+_File generation:_
 
-### Agent B: AI Session Capture
+- Create markdown files with YAML frontmatter for each extracted unit
+- Place in appropriate domain directories based on LLM suggestions
 
-- Owns: `crates/nugget-capture/`, `crates/nugget-mcp/`
-- Depends on: nugget-core (types), nugget-inbox (write items), nugget-store (brain path)
-- Focus: MCP server, capture functions, conversation/URL/text capture
-- Does NOT need: clipboard APIs, daemon management
+_Git + PR operations:_
+
+- Create branch: `nugget/session-<timestamp>` in brain repo
+- Commit knowledge files
+- Push branch to remote
+- Create GitHub PR (via `gh` CLI or GitHub API)
+- PR title: "Knowledge from session `<date> <time>`"
+- PR body: summary of extracted knowledge, list of proposed files
+
+_Hook integration:_
+
+- Claude Code session-end hook invokes `nugget capture-session` as background process
+- Notification: display "This session will be analyzed for knowledge capture"
+- Pass transcript path to capture agent
+
+**nugget-cli** additions:
+
+- `nugget capture-session [--transcript <path>]` — run capture pipeline (invoked by hook or manually)
+
+**Key deps**: reqwest (Claude API), git2 or shell git, serde_json (JSONL parsing)
+
+**Deliverable**: End a Claude Code session -> hook fires -> background capture runs -> GitHub PR appears in brain repo -> review and merge -> next session, Claude Code retrieves the knowledge via MCP. Full flywheel demonstrated.
 
 ---
 
 ## Verification
 
-1. **Phase 0**: `nugget init && nugget domain add coding && nugget inbox` → empty inbox, correct directory structure
-2. **Phase 1A**: Start daemon → copy a blog URL → `nugget inbox` shows it → copy `localhost:3000` → inbox unchanged → copy a code snippet → inbox unchanged
-3. **Phase 1B**: Configure Claude Code with Nugget MCP → have Claude Code call `capture_learnings` → `nugget inbox` shows the captured learnings → `nugget accept 1` → file appears in correct domain folder
-4. **End-to-end**: Copy a URL while browsing → it appears in inbox. Ask Claude Code for help debugging → it captures learnings at session end → they appear in inbox. Review and accept both. Run `nugget search` → both are findable.
+### Phase 1
+
+- `nugget init` creates correct brain directory structure (brain.yaml, domains/)
+- Knowledge files round-trip through parse/serialize correctly
+- Unit tests with insta snapshots for frontmatter parsing
+- The `---` delimiter is handled correctly (only first pair is frontmatter)
+
+### Phase 2
+
+- Brain with 20+ manually created files across 2-3 domains
+- `nugget ask "cache invalidation"` returns relevant coding knowledge, not fashion knowledge
+- Claude Code MCP integration: ask a question -> `get_relevant_context` called -> relevant knowledge returned
+- Index rebuilds correctly from files after deletion
+- Embedding model switch + full reindex works
+
+### Phase 3
+
+- Session ends -> hook fires -> `nugget capture-session` runs in background
+- Transcript parsed correctly (handles long sessions, tool calls)
+- LLM extracts meaningful knowledge (not noise, not project-specific details)
+- PR created with correct branch, files in right domains, meaningful title/description
+- Merge PR -> knowledge in brain -> next session retrieves it
+- Two sessions ending simultaneously -> no conflicts (unique branch names)
+
+### End-to-end flywheel
+
+1. `nugget init` -> empty brain
+2. Configure Claude Code with Nugget MCP
+3. Have a Claude Code session about a technical topic
+4. Session ends -> PR appears
+5. Review and merge PR
+6. New session -> ask about same topic -> Claude Code uses knowledge from brain
+7. Knowledge compounds with each session
 
 ---
 
-## Tech stack summary
+## Tech Stack
 
-| Component        | Crate            | Key deps                         |
-| ---------------- | ---------------- | -------------------------------- |
-| Core types       | nugget-core      | serde, serde_yaml, chrono, uuid  |
-| File store       | nugget-store     | nugget-core, serde_yaml, walkdir |
-| Inbox            | nugget-inbox     | nugget-core, nugget-store        |
-| Clipboard daemon | nugget-clipboard | arboard, regex, nugget-inbox     |
-| Capture engine   | nugget-capture   | nugget-inbox                     |
-| MCP server       | nugget-mcp       | rmcp, tokio, nugget-capture      |
-| CLI              | nugget-cli       | clap, nugget-\*                  |
-| Index (Phase 2)  | nugget-index     | rusqlite, tantivy, fastembed     |
+| Component | Choice | Why |
+| --- | --- | --- |
+| Language | Rust | Single binary, performance, ecosystem |
+| CLI | clap | Standard Rust CLI |
+| Markdown parsing | pulldown-cmark | Rust-native CommonMark |
+| YAML parsing | serde_yaml | Standard Rust YAML |
+| Database | SQLite (rusqlite) | Metadata, graph, FTS5, embedded |
+| Embeddings (default) | fastembed-rs | Local, CPU, offline, no API key |
+| Embeddings (optional) | OpenAI / Voyage API | Higher quality, requires API key |
+| LLM (extraction + reranking) | Claude API (reqwest) | Knowledge extraction and relevance scoring |
+| MCP server | rmcp | Rust MCP SDK |
+| Git operations | git2 or shell git | Branch/commit/push for PR creation |
+| GitHub PRs | gh CLI or GitHub API | PR creation |
+| Async runtime | tokio | Standard Rust async |
+| File walking | walkdir | Brain directory traversal |
 
 ---
 
-## Current state
+## Current State
 
-- **Phase 0**: DONE — all 4 foundation crates built and tested
-- **Phase 1A**: NOT STARTED
-- **Phase 1B**: NOT STARTED
+- **Phase 1**: NOT STARTED (previous Phase 0 code may be partially reusable — review needed)
 - **Phase 2**: NOT STARTED
+- **Phase 3**: NOT STARTED
