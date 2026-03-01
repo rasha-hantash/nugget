@@ -8,7 +8,7 @@ Nugget is an AI memory layer for Claude Code. It automatically extracts knowledg
 
 - **Write path**: Session-end hook -> transcript analysis -> LLM extraction -> GitHub PR
 - **Read path**: Single MCP tool (`get_relevant_context`) -> 3-layer retrieval pipeline
-- **Storage**: Markdown files (source of truth) + SQLite derived index (metadata, graph, FTS5, embeddings)
+- **Storage**: Markdown files (source of truth) + SQLite derived index (metadata, FTS5, embeddings) + Memgraph (graph relationships)
 - **CLI**: `nugget init`, `nugget serve`, `nugget ask "..."`, `nugget capture-session`
 
 ---
@@ -34,8 +34,8 @@ nugget/
 | --- | --- | --- |
 | nugget-core | Types, serialization | serde, serde_yaml, chrono, uuid |
 | nugget-store | File I/O, brain directory ops | nugget-core, walkdir |
-| nugget-index | SQLite index, chunking, embeddings, rebuild | nugget-core, nugget-store, rusqlite, fastembed, pulldown-cmark, text-splitter |
-| nugget-retrieve | Hybrid search + graph + LLM re-ranking | nugget-index, reqwest (for LLM re-ranking) |
+| nugget-index | SQLite index, chunking, embeddings, Memgraph sync, rebuild | nugget-core, nugget-store, rusqlite, fastembed, pulldown-cmark, text-splitter, bolt-client or neo4rs |
+| nugget-retrieve | Hybrid search + Memgraph graph expansion + LLM re-ranking | nugget-index, reqwest (for LLM re-ranking), bolt-client or neo4rs |
 | nugget-capture | Transcript analysis, LLM extraction, Git/PR | nugget-core, nugget-index, reqwest, git2 |
 | nugget-mcp | MCP server | nugget-retrieve, rmcp, tokio |
 | nugget-cli | CLI entry point | all crates, clap |
@@ -85,23 +85,32 @@ Build the entire read path so Claude Code can query the brain.
 - SQLite schema:
   - `units` table: id, path, title, type, domain, tags (JSON), confidence, source, created, last_modified, content
   - `chunks` table: id (unit_id + chunk_index), unit_id, content (with breadcrumb), heading_breadcrumb, heading_level, position, embedding (BLOB)
-  - `relationships` table: source_id, target_id, relation_type
   - `chunks_fts` FTS5 virtual table over chunk content
+- Memgraph sync:
+  - On index build/rebuild: create unit nodes (id, type, domain, title), domain nodes, tag nodes
+  - Create relationship edges from frontmatter `related:` fields (typed: uses, implements, requires_understanding_of, etc.)
+  - Create domain edges (`unit --in_domain--> domain`) and tag edges (`unit --tagged--> tag`)
+  - On incremental update: delete old node's edges, recreate from updated frontmatter
+  - On rebuild: clear graph, recreate from all files
+  - Connection via Bolt protocol (Memgraph is Bolt-compatible)
 - Markdown chunking pipeline:
   - Parse heading tree (pulldown-cmark), split at heading boundaries
   - Prepend heading breadcrumbs to chunk text before embedding
   - Size normalization: sub-split >512 token chunks at paragraphs (10-15% overlap); merge <50 token chunks with siblings
-- Build index from files: walk brain directory, parse each file, chunk it, insert units + chunks into SQLite
+- Build index from files: walk brain directory, parse each file, chunk it, insert units + chunks into SQLite, sync relationships to Memgraph
 - Generate embeddings per chunk: fastembed-rs (default) or API provider (configurable in brain.yaml)
-- Incremental update: reindex a single file by path (delete old chunks, re-chunk, re-embed)
-- Rebuild: drop and recreate from files
+- Incremental update: reindex a single file by path (delete old chunks, re-chunk, re-embed, update Memgraph edges)
+- Rebuild: drop and recreate SQLite + Memgraph from files
 
 **nugget-retrieve** (`crates/nugget-retrieve/`)
 
 - Layer 1a: Embedding search on chunks — cosine similarity, top ~50 chunks
 - Layer 1b: BM25/FTS5 search on chunks — full-text match, top ~50 chunks
 - Layer 1c: RRF fusion — combine embedding + BM25 results via `score = 1/(k + rank)` (k=60), map chunks to parent units
-- Layer 2: Graph expansion — for top units, walk 1-2 hops in relationships table, pull chunks from related units
+- Layer 2: Graph expansion via Memgraph — for top units, run Cypher multi-hop traversal (1-3 hops), pull chunks from related units. Example queries:
+  - Direct relationships: `MATCH (a:Unit {id: $id})-[r]->(b:Unit) RETURN b`
+  - Multi-hop discovery: `MATCH (a:Unit {id: $id})-[*1..3]->(b:Unit) RETURN DISTINCT b`
+  - Domain-aware expansion: `MATCH (a:Unit {id: $id})-[:in_domain]->(d)<-[:in_domain]-(b:Unit) RETURN b` (find units in same domain)
 - Layer 3: LLM re-ranking — score chunks with unit context, return top 5-10 grouped by unit
 - Single entry point: `retrieve(task_description, index) -> Vec<RankedResult>`
 
@@ -117,9 +126,11 @@ Build the entire read path so Claude Code can query the brain.
 - `nugget serve` — start MCP server
 - `nugget ask "..."` — query the brain from terminal (retrieval pipeline + LLM formats answer)
 
-**Key deps**: rusqlite, fastembed, rmcp, tokio, reqwest (for Claude API)
+**Key deps**: rusqlite, fastembed, rmcp, tokio, reqwest (for Claude API), bolt-client or neo4rs (Memgraph)
 
-**Deliverable**: Manually populate a brain with ~20 knowledge files across 2-3 domains. `nugget ask "how to handle retries"` returns relevant results. Configure Claude Code MCP -> ask a domain question -> Claude Code calls `get_relevant_context` -> gets relevant knowledge -> uses it in response.
+**Prerequisite**: Memgraph running locally (Docker: `docker run -p 7687:7687 memgraph/memgraph`).
+
+**Deliverable**: Manually populate a brain with ~20 knowledge files across 2-3 domains with `related:` fields linking them. `nugget ask "how to handle retries"` returns relevant results including graph-expanded related units. Configure Claude Code MCP -> ask a domain question -> Claude Code calls `get_relevant_context` -> gets relevant knowledge -> uses it in response.
 
 ---
 
@@ -183,11 +194,13 @@ _Hook integration:_
 
 ### Phase 2
 
-- Brain with 20+ manually created files across 2-3 domains
+- Brain with 20+ manually created files across 2-3 domains, with `related:` fields linking units
 - `nugget ask "cache invalidation"` returns relevant coding knowledge, not fashion knowledge
+- Graph expansion: querying a unit with relationships returns related units from 1-3 hops away
 - Claude Code MCP integration: ask a question -> `get_relevant_context` called -> relevant knowledge returned
-- Index rebuilds correctly from files after deletion
+- Index rebuilds correctly from files after deletion (both SQLite and Memgraph)
 - Embedding model switch + full reindex works
+- Memgraph graph matches frontmatter relationships (verify with `MATCH (n)-[r]->(m) RETURN n, r, m`)
 
 ### Phase 3
 
@@ -219,7 +232,9 @@ _Hook integration:_
 | Markdown parsing | pulldown-cmark | Rust-native CommonMark, heading tree extraction |
 | Markdown chunking | text-splitter | Semantic markdown splitting with size control |
 | YAML parsing | serde_yaml | Standard Rust YAML |
-| Database | SQLite (rusqlite) | Metadata, graph, FTS5, embedded |
+| Database (text/embeddings) | SQLite (rusqlite) | Metadata, FTS5, embeddings, embedded |
+| Database (graph) | [Memgraph](https://memgraph.com/) | In-memory graph, Cypher queries, Bolt protocol, multi-hop traversal |
+| Memgraph client | bolt-client or [neo4rs](https://github.com/neo4j-labs/neo4rs) | Bolt-compatible Rust client (neo4rs works with Memgraph) |
 | Embeddings (default) | fastembed-rs | Local, CPU, offline, no API key |
 | Embeddings (optional) | OpenAI / Voyage API | Higher quality, requires API key |
 | LLM (extraction + reranking) | Claude API (reqwest) | Knowledge extraction and relevance scoring |
