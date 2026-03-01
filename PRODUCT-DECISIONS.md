@@ -88,10 +88,12 @@ The retrieval pipeline searches against **chunks** (derived from files), grouped
 1. **Embedding search** on chunks — vector similarity (~50 chunks)
 2. **BM25/FTS5 search** on chunks — full-text match (~50 chunks)
 3. **RRF fusion** — combine embedding + BM25 via Reciprocal Rank Fusion, map to parent units
-4. **Graph expansion** — walk relationship edges on units, pull in chunks from related units
+4. **Graph expansion** via Memgraph — multi-hop Cypher traversal on units, pull in chunks from related units
 5. **LLM re-ranking** — score chunks with unit context for actual relevance (top 5-10)
 
 **Why hybrid search (embeddings + BM25)?** BM25 catches exact terminology that embeddings miss. Proven in production RAG systems.
+
+**Why Memgraph for graph expansion instead of SQLite?** Multi-hop traversal is the killer feature for knowledge retrieval. When someone asks "how do I handle errors in async Rust?", the graph needs to walk 2-3 hops from `error-handling` to discover `Result types`, `tokio error propagation`, `anyhow vs thiserror`. In SQLite this requires recursive CTEs that get slow and awkward past 2 hops. In Memgraph, variable-length path queries are native Cypher: `MATCH (a)-[*1..3]->(b)`. Memgraph also provides graph algorithms (community detection, PageRank) that can improve retrieval quality as the brain grows. See [Graph expansion decision](#decision-memgraph-for-graph-storage) below.
 
 **Why build all layers from the start?** The full pipeline works at every brain size. At small sizes, embeddings + re-ranking carry the weight. Graph expansion kicks in as the brain grows.
 
@@ -116,14 +118,61 @@ Nugget intercepts the prompt, searches the brain, and injects relevant context b
 
 Human-readable, Git-versionable, editable in any editor. Non-negotiable — the PR workflow requires actual files.
 
-### Decision: SQLite derived index
+### Decision: SQLite derived index (text search + embeddings)
 
 - **Units table**: id, path, title, type, domain, tags, confidence, source, created, last_modified, content
 - **Chunks table**: id, unit_id, content (with breadcrumb), heading_breadcrumb, heading_level, position, embedding
-- **Relationships table**: source_id, target_id, relation_type
 - **FTS5 virtual table**: full-text search over chunk content
 
 Rebuilt from files if corrupted or lost. Nothing is lost.
+
+**Note**: The `relationships` table previously planned for SQLite has been moved to Memgraph. See [Memgraph decision](#decision-memgraph-for-graph-storage) below.
+
+### Decision: Memgraph for graph storage
+
+Relationships between knowledge units are stored in [Memgraph](https://memgraph.com/), an open-source in-memory graph database with native Cypher support. Memgraph runs as a single Docker container or binary alongside the Nugget process.
+
+**What lives in Memgraph:**
+
+- Knowledge unit nodes (id, type, domain, title) — lightweight projections, not full content
+- Relationship edges from frontmatter `related:` fields (uses, implements, requires_understanding_of, etc.)
+- Domain and tag nodes with edges (e.g., `unit --in_domain--> "rust"`, `unit --tagged--> "concurrency"`)
+
+**What stays in SQLite:**
+
+- Full content, chunks, embeddings, FTS5 — everything needed for layers 1 and 3 of the retrieval pipeline
+
+**Why Memgraph over SQLite `relationships` table:**
+
+- Native multi-hop traversal: `MATCH (a)-[*1..3]->(b)` vs. recursive CTEs
+- Graph algorithms (community detection, shortest path, PageRank) for future retrieval improvements
+- In-memory performance for graph operations
+- Cypher query language is expressive and well-documented
+
+**Why Memgraph over Neo4j:**
+
+- Fully open-source (no enterprise-only features needed)
+- Lower resource footprint for single-user workloads
+- Bolt-compatible (same protocol, easy to swap later if needed)
+
+**Why not Mem0 (the product):**
+
+- Mem0 bundles graph construction + storage + retrieval with LLM extraction on every read/write — adds 3 runtime dependencies (LLM API, vector DB, graph DB) and API costs
+- Nugget's 3-layer pipeline (BM25 + embeddings + LLM re-ranking) is more sophisticated than Mem0's retrieval
+- For other users, "install Rust binary + Memgraph" is simpler than "set up Neo4j + Qdrant + OpenAI API key"
+- The graph enrichment idea from Mem0 is valuable — we adopt it at write time (LLM extracts relationships during capture, writes them to frontmatter `related:` fields) without the runtime dependency
+
+**Sync strategy**: The `nugget-index` crate syncs frontmatter relationships to Memgraph during index build/rebuild. Incremental updates on single-file reindex.
+
+**Rebuild**: Like SQLite, the Memgraph graph is derived from markdown files and can be rebuilt from scratch.
+
+**References:**
+
+- [Memgraph documentation](https://memgraph.com/docs)
+- [Memgraph GitHub](https://github.com/memgraph/memgraph)
+- [Mem0 Graph Memory architecture](https://docs.mem0.ai/open-source/features/graph-memory) — informed the graph enrichment approach
+- [Mem0 paper (arxiv)](https://arxiv.org/html/2504.19413v1) — dual retrieval (entity-centric + semantic triplet) informed Layer 2 design
+- [Graph-based Agent Memory taxonomy](https://arxiv.org/html/2602.05665) — survey of graph memory approaches
 
 ### Decision: Agent-managed organization
 
