@@ -91,8 +91,10 @@ Build the entire read path so Claude Code can query the brain.
   - Create relationship edges from frontmatter `related:` fields (typed: uses, implements, requires_understanding_of, etc.)
   - Create domain edges (`unit --in_domain--> domain`) and tag edges (`unit --tagged--> tag`)
   - On incremental update: delete old node's edges, recreate from updated frontmatter
-  - On rebuild: clear graph, recreate from all files
+  - On file deletion: remove the unit node and all its edges from Memgraph (cascade delete via `DETACH DELETE`)
+  - On rebuild: clear graph (`MATCH (n) DETACH DELETE n`), recreate from all files
   - Connection via Bolt protocol (Memgraph is Bolt-compatible)
+  - Failure mode: if Memgraph is unreachable, log warning and continue with SQLite-only indexing. Graph expansion (Layer 2) degrades gracefully — skipped when unavailable. Next `nugget rebuild` re-syncs.
 - Markdown chunking pipeline:
   - Parse heading tree (pulldown-cmark), split at heading boundaries
   - Prepend heading breadcrumbs to chunk text before embedding
@@ -110,7 +112,7 @@ Build the entire read path so Claude Code can query the brain.
 - Layer 2: Graph expansion via Memgraph — for top units, run Cypher multi-hop traversal (1-3 hops), pull chunks from related units. Example queries:
   - Direct relationships: `MATCH (a:Unit {id: $id})-[r]->(b:Unit) RETURN b`
   - Multi-hop discovery: `MATCH (a:Unit {id: $id})-[*1..3]->(b:Unit) RETURN DISTINCT b`
-  - Domain-aware expansion: `MATCH (a:Unit {id: $id})-[:in_domain]->(d)<-[:in_domain]-(b:Unit) RETURN b` (find units in same domain)
+  - Domain-aware expansion: `MATCH (a:Unit {id: $id})-[:in_domain]->(d)<-[:in_domain]-(b:Unit) RETURN b LIMIT 20` (find units in same domain, capped to prevent broad-domain blowup)
 - Layer 3: LLM re-ranking — score chunks with unit context, return top 5-10 grouped by unit
 - Single entry point: `retrieve(task_description, index) -> Vec<RankedResult>`
 
@@ -200,7 +202,11 @@ _Hook integration:_
 - Claude Code MCP integration: ask a question -> `get_relevant_context` called -> relevant knowledge returned
 - Index rebuilds correctly from files after deletion (both SQLite and Memgraph)
 - Embedding model switch + full reindex works
-- Memgraph graph matches frontmatter relationships (verify with `MATCH (n)-[r]->(m) RETURN n, r, m`)
+- Memgraph graph integrity:
+  - All frontmatter `related:` fields have corresponding edges in Memgraph
+  - No orphaned nodes (every node has at least one edge or is a unit node with a matching file)
+  - File deletion removes corresponding node and edges
+  - Verify with: `MATCH (n)-[r]->(m) RETURN n, r, m` and `MATCH (n) WHERE NOT (n)--() RETURN n` (orphan check)
 
 ### Phase 3
 

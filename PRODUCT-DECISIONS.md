@@ -126,7 +126,7 @@ Human-readable, Git-versionable, editable in any editor. Non-negotiable — the 
 
 Rebuilt from files if corrupted or lost. Nothing is lost.
 
-**Note**: The `relationships` table previously planned for SQLite has been moved to Memgraph. See [Memgraph decision](#decision-memgraph-for-graph-storage) below.
+Graph relationships are stored in Memgraph, not SQLite. See [Memgraph decision](#decision-memgraph-for-graph-storage) below.
 
 ### Decision: Memgraph for graph storage
 
@@ -162,9 +162,11 @@ Relationships between knowledge units are stored in [Memgraph](https://memgraph.
 - For other users, "install Rust binary + Memgraph" is simpler than "set up Neo4j + Qdrant + OpenAI API key"
 - The graph enrichment idea from Mem0 is valuable — we adopt it at write time (LLM extracts relationships during capture, writes them to frontmatter `related:` fields) without the runtime dependency
 
-**Sync strategy**: The `nugget-index` crate syncs frontmatter relationships to Memgraph during index build/rebuild. Incremental updates on single-file reindex.
+**Sync strategy**: The `nugget-index` crate syncs frontmatter relationships to Memgraph during index build/rebuild. Incremental updates on single-file reindex. On file deletion, the corresponding unit node and all its edges are removed from Memgraph (preventing orphaned nodes).
 
-**Rebuild**: Like SQLite, the Memgraph graph is derived from markdown files and can be rebuilt from scratch.
+**Failure handling**: If Memgraph is unavailable or sync fails, the index build logs a warning and proceeds with SQLite-only indexing. Retrieval degrades gracefully — layers 1 and 3 still work, layer 2 (graph expansion) is skipped. This is acceptable because graph expansion is additive; the core search pipeline functions without it. On next successful Memgraph connection, a full rebuild re-syncs the graph.
+
+**Rebuild**: Like SQLite, the Memgraph graph is derived from markdown files and can be rebuilt from scratch. There is no drift detection between SQLite and Memgraph — if they diverge (e.g., after a partial sync failure), `nugget rebuild` re-derives both from the markdown source of truth.
 
 **References:**
 
