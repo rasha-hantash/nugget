@@ -8,7 +8,7 @@ Nugget is an AI memory layer for Claude Code. It automatically extracts knowledg
 
 - **Write path**: Session-end hook -> transcript analysis -> LLM extraction -> GitHub PR
 - **Read path**: Single MCP tool (`get_relevant_context`) -> 3-layer retrieval pipeline
-- **Storage**: Markdown files (source of truth) + SQLite derived index (metadata, FTS5, embeddings) + Memgraph (graph relationships)
+- **Storage**: Markdown files (source of truth) + SQLite derived index (metadata, FTS5, embeddings, graph relationships)
 - **CLI**: `nugget init`, `nugget serve`, `nugget ask "..."`, `nugget capture-session`
 
 ---
@@ -34,8 +34,8 @@ nugget/
 | --- | --- | --- |
 | nugget-core | Types, serialization | serde, serde_yaml, chrono, uuid |
 | nugget-store | File I/O, brain directory ops | nugget-core, walkdir |
-| nugget-index | SQLite index, chunking, embeddings, Memgraph sync, rebuild | nugget-core, nugget-store, rusqlite, fastembed, pulldown-cmark, text-splitter, bolt-client or neo4rs |
-| nugget-retrieve | Hybrid search + Memgraph graph expansion + LLM re-ranking | nugget-index, reqwest (for LLM re-ranking), bolt-client or neo4rs |
+| nugget-index | SQLite index, chunking, embeddings, rebuild | nugget-core, nugget-store, rusqlite, fastembed, pulldown-cmark, text-splitter |
+| nugget-retrieve | Hybrid search + graph expansion + LLM re-ranking | nugget-index, reqwest (for LLM re-ranking) |
 | nugget-capture | Transcript analysis, LLM extraction, Git/PR | nugget-core, nugget-index, reqwest, git2 |
 | nugget-mcp | MCP server | nugget-retrieve, rmcp, tokio |
 | nugget-cli | CLI entry point | all crates, clap |
@@ -86,33 +86,36 @@ Build the entire read path so Claude Code can query the brain.
   - `units` table: id, path, title, type, domain, tags (JSON), confidence, source, created, last_modified, content
   - `chunks` table: id (unit_id + chunk_index), unit_id, content (with breadcrumb), heading_breadcrumb, heading_level, position, embedding (BLOB)
   - `chunks_fts` FTS5 virtual table over chunk content
-- Memgraph sync:
-  - On index build/rebuild: create unit nodes (id, type, domain, title), domain nodes, tag nodes
-  - Create relationship edges from frontmatter `related:` fields (typed: uses, implements, requires_understanding_of, etc.)
-  - Create domain edges (`unit --in_domain--> domain`) and tag edges (`unit --tagged--> tag`)
-  - On incremental update: delete old node's edges, recreate from updated frontmatter
-  - On file deletion: remove the unit node and all its edges from Memgraph (cascade delete via `DETACH DELETE`)
-  - On rebuild: clear graph (`MATCH (n) DETACH DELETE n`), recreate from all files
-  - Connection via Bolt protocol (Memgraph is Bolt-compatible)
-  - Failure mode: if Memgraph is unreachable, log warning and continue with SQLite-only indexing. Graph expansion (Layer 2) degrades gracefully — skipped when unavailable. Next `nugget rebuild` re-syncs.
+- Relationships table:
+  - On index build/rebuild: insert relationship edges from frontmatter `related:` fields (typed: uses, implements, requires_understanding_of, etc.)
+  - On incremental update: delete old relationships for the unit, recreate from updated frontmatter
+  - On file deletion: remove all relationships where the unit is source or target
+  - On rebuild: drop and recreate from all files
 - Markdown chunking pipeline:
   - Parse heading tree (pulldown-cmark), split at heading boundaries
   - Prepend heading breadcrumbs to chunk text before embedding
   - Size normalization: sub-split >512 token chunks at paragraphs (10-15% overlap); merge <50 token chunks with siblings
-- Build index from files: walk brain directory, parse each file, chunk it, insert units + chunks into SQLite, sync relationships to Memgraph
+- Build index from files: walk brain directory, parse each file, chunk it, insert units + chunks + relationships into SQLite
 - Generate embeddings per chunk: fastembed-rs (default) or API provider (configurable in brain.yaml)
-- Incremental update: reindex a single file by path (delete old chunks, re-chunk, re-embed, update Memgraph edges)
-- Rebuild: drop and recreate SQLite + Memgraph from files
+- Incremental update: reindex a single file by path (delete old chunks and relationships, re-chunk, re-embed, re-insert relationships)
+- Rebuild: drop and recreate SQLite from files
 
 **nugget-retrieve** (`crates/nugget-retrieve/`)
 
 - Layer 1a: Embedding search on chunks — cosine similarity, top ~50 chunks
 - Layer 1b: BM25/FTS5 search on chunks — full-text match, top ~50 chunks
 - Layer 1c: RRF fusion — combine embedding + BM25 results via `score = 1/(k + rank)` (k=60), map chunks to parent units
-- Layer 2: Graph expansion via Memgraph — for top units, run Cypher multi-hop traversal (1-3 hops), pull chunks from related units. Example queries:
-  - Direct relationships: `MATCH (a:Unit {id: $id})-[r]->(b:Unit) RETURN b`
-  - Multi-hop discovery: `MATCH (a:Unit {id: $id})-[*1..3]->(b:Unit) RETURN DISTINCT b`
-  - Domain-aware expansion: `MATCH (a:Unit {id: $id})-[:in_domain]->(d)<-[:in_domain]-(b:Unit) RETURN b LIMIT 20` (find units in same domain, capped to prevent broad-domain blowup)
+- Layer 2: Graph expansion via SQLite — for top units, run recursive CTE (1-3 hops) on relationships table, pull chunks from related units. Example query:
+  ```sql
+  WITH RECURSIVE related_units(id, depth) AS (
+      SELECT target_id, 1 FROM relationships WHERE source_id = ?
+      UNION
+      SELECT r.target_id, ru.depth + 1
+      FROM relationships r JOIN related_units ru ON r.source_id = ru.id
+      WHERE ru.depth < 3
+  )
+  SELECT DISTINCT id FROM related_units;
+  ```
 - Layer 3: LLM re-ranking — score chunks with unit context, return top 5-10 grouped by unit
 - Single entry point: `retrieve(task_description, index) -> Vec<RankedResult>`
 
@@ -128,9 +131,7 @@ Build the entire read path so Claude Code can query the brain.
 - `nugget serve` — start MCP server
 - `nugget ask "..."` — query the brain from terminal (retrieval pipeline + LLM formats answer)
 
-**Key deps**: rusqlite, fastembed, rmcp, tokio, reqwest (for Claude API), bolt-client or neo4rs (Memgraph)
-
-**Prerequisite**: Memgraph running locally (Docker: `docker run -p 7687:7687 memgraph/memgraph`).
+**Key deps**: rusqlite, fastembed, rmcp, tokio, reqwest (for Claude API)
 
 **Deliverable**: Manually populate a brain with ~20 knowledge files across 2-3 domains with `related:` fields linking them. `nugget ask "how to handle retries"` returns relevant results including graph-expanded related units. Configure Claude Code MCP -> ask a domain question -> Claude Code calls `get_relevant_context` -> gets relevant knowledge -> uses it in response.
 
@@ -198,15 +199,14 @@ _Hook integration:_
 
 - Brain with 20+ manually created files across 2-3 domains, with `related:` fields linking units
 - `nugget ask "cache invalidation"` returns relevant coding knowledge, not fashion knowledge
-- Graph expansion: querying a unit with relationships returns related units from 1-3 hops away
+- Graph expansion: querying a unit with relationships returns related units from 1-3 hops away via SQLite recursive CTEs
 - Claude Code MCP integration: ask a question -> `get_relevant_context` called -> relevant knowledge returned
-- Index rebuilds correctly from files after deletion (both SQLite and Memgraph)
+- Index rebuilds correctly from files after deletion
 - Embedding model switch + full reindex works
-- Memgraph graph integrity:
-  - All frontmatter `related:` fields have corresponding edges in Memgraph
-  - No orphaned nodes (every node has at least one edge or is a unit node with a matching file)
-  - File deletion removes corresponding node and edges
-  - Verify with: `MATCH (n)-[r]->(m) RETURN n, r, m` and `MATCH (n) WHERE NOT (n)--() RETURN n` (orphan check)
+- Relationship integrity:
+  - All frontmatter `related:` fields have corresponding rows in the relationships table
+  - File deletion removes corresponding relationships
+  - Rebuild produces identical relationships table from markdown source of truth
 
 ### Phase 3
 
@@ -238,9 +238,7 @@ _Hook integration:_
 | Markdown parsing | pulldown-cmark | Rust-native CommonMark, heading tree extraction |
 | Markdown chunking | text-splitter | Semantic markdown splitting with size control |
 | YAML parsing | serde_yaml | Standard Rust YAML |
-| Database (text/embeddings) | SQLite (rusqlite) | Metadata, FTS5, embeddings, embedded |
-| Database (graph) | [Memgraph](https://memgraph.com/) | In-memory graph, Cypher queries, Bolt protocol, multi-hop traversal |
-| Memgraph client | bolt-client or [neo4rs](https://github.com/neo4j-labs/neo4rs) | Bolt-compatible Rust client (neo4rs works with Memgraph) |
+| Database | SQLite (rusqlite) | Metadata, FTS5, embeddings, graph relationships, embedded |
 | Embeddings (default) | fastembed-rs | Local, CPU, offline, no API key |
 | Embeddings (optional) | OpenAI / Voyage API | Higher quality, requires API key |
 | LLM (extraction + reranking) | Claude API (reqwest) | Knowledge extraction and relevance scoring |

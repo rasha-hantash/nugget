@@ -40,8 +40,8 @@ Dependency flow: `nugget-cli -> nugget-store -> nugget-core`
 
 ### Planned crates (not yet implemented)
 
-- `nugget-index` — SQLite + FTS5 + embeddings (rusqlite, fastembed-rs)
-- `nugget-retrieve` — 3-layer retrieval pipeline (embedding + BM25 + graph + LLM re-ranking)
+- `nugget-index` — SQLite + FTS5 + embeddings + graph relationships (rusqlite, fastembed-rs)
+- `nugget-retrieve` — 3-layer retrieval pipeline (embedding + BM25 + SQLite graph expansion + LLM re-ranking)
 - `nugget-mcp` — MCP server with single tool (rmcp)
 - `nugget-capture` — Transcript analysis + GitHub PR creation
 

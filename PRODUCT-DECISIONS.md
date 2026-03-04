@@ -88,12 +88,12 @@ The retrieval pipeline searches against **chunks** (derived from files), grouped
 1. **Embedding search** on chunks — vector similarity (~50 chunks)
 2. **BM25/FTS5 search** on chunks — full-text match (~50 chunks)
 3. **RRF fusion** — combine embedding + BM25 via Reciprocal Rank Fusion, map to parent units
-4. **Graph expansion** via Memgraph — multi-hop Cypher traversal on units, pull in chunks from related units
+4. **Graph expansion** via SQLite — walk relationship edges in the `relationships` table, pull in chunks from related units
 5. **LLM re-ranking** — score chunks with unit context for actual relevance (top 5-10)
 
 **Why hybrid search (embeddings + BM25)?** BM25 catches exact terminology that embeddings miss. Proven in production RAG systems.
 
-**Why Memgraph for graph expansion instead of SQLite?** Multi-hop traversal is the killer feature for knowledge retrieval. When someone asks "how do I handle errors in async Rust?", the graph needs to walk 2-3 hops from `error-handling` to discover `Result types`, `tokio error propagation`, `anyhow vs thiserror`. In SQLite this requires recursive CTEs that get slow and awkward past 2 hops. In Memgraph, variable-length path queries are native Cypher: `MATCH (a)-[*1..3]->(b)`. Memgraph also provides graph algorithms (community detection, PageRank) that can improve retrieval quality as the brain grows. See [Graph expansion decision](#decision-memgraph-for-graph-storage) below.
+**Why SQLite for graph expansion instead of a graph database?** See [Graph storage decision](#decision-sqlite-for-graph-relationships-no-graph-database) below. At Nugget's expected scale (hundreds to low thousands of units), SQLite recursive CTEs handle 1-3 hop traversals efficiently. The relationship data from ~30 candidate units easily fits in an LLM context window, making the model itself the most capable "graph engine" for relevance reasoning.
 
 **Why build all layers from the start?** The full pipeline works at every brain size. At small sizes, embeddings + re-ranking carry the weight. Graph expansion kicks in as the brain grows.
 
@@ -118,61 +118,75 @@ Nugget intercepts the prompt, searches the brain, and injects relevant context b
 
 Human-readable, Git-versionable, editable in any editor. Non-negotiable — the PR workflow requires actual files.
 
-### Decision: SQLite derived index (text search + embeddings)
+### Decision: SQLite derived index (text search + embeddings + graph)
 
 - **Units table**: id, path, title, type, domain, tags, confidence, source, created, last_modified, content
 - **Chunks table**: id, unit_id, content (with breadcrumb), heading_breadcrumb, heading_level, position, embedding
+- **Relationships table**: source_id, target_id, relation_type — graph edges between units
 - **FTS5 virtual table**: full-text search over chunk content
 
 Rebuilt from files if corrupted or lost. Nothing is lost.
 
-Graph relationships are stored in Memgraph, not SQLite. See [Memgraph decision](#decision-memgraph-for-graph-storage) below.
+### Decision: SQLite for graph relationships (no graph database)
 
-### Decision: Memgraph for graph storage
+Relationships between knowledge units are stored in a SQLite `relationships` table alongside all other derived data. No external graph database (Memgraph, Neo4j, etc.) is used.
 
-Relationships between knowledge units are stored in [Memgraph](https://memgraph.com/), an open-source in-memory graph database with native Cypher support. Memgraph runs as a single Docker container or binary alongside the Nugget process.
+**What lives in SQLite (all in one database):**
 
-**What lives in Memgraph:**
+- Knowledge unit metadata (units table)
+- Chunks with embeddings (chunks table)
+- Relationship edges from frontmatter `related:` fields (relationships table)
+- FTS5 full-text search (chunks_fts virtual table)
 
-- Knowledge unit nodes (id, type, domain, title) — lightweight projections, not full content
-- Relationship edges from frontmatter `related:` fields (uses, implements, requires_understanding_of, etc.)
-- Domain and tag nodes with edges (e.g., `unit --in_domain--> "rust"`, `unit --tagged--> "concurrency"`)
+**Why SQLite is sufficient — no graph database needed:**
 
-**What stays in SQLite:**
+At Nugget's expected scale (hundreds to low thousands of knowledge units), a dedicated graph database is infrastructure complexity that doesn't earn its keep. This decision was informed by [Hamel Husain & Jo Kristian Bergum's analysis on graph databases in RAG systems](https://hamel.dev/notes/llm/rag/p7-graph-db.html), which argues that teams should exhaust simpler approaches before reaching for specialized graph infrastructure.
 
-- Full content, chunks, embeddings, FTS5 — everything needed for layers 1 and 3 of the retrieval pipeline
+The core arguments:
 
-**Why Memgraph over SQLite `relationships` table:**
+1. **Scale doesn't justify it.** Graph databases earn their keep at millions of nodes with billions of edges (social networks, fraud detection, supply chains). Nugget's brain will have hundreds to low thousands of units — orders of magnitude below the threshold where SQLite recursive CTEs become a bottleneck. Early Facebook ran their social graph on MySQL.
 
-- Native multi-hop traversal: `MATCH (a)-[*1..3]->(b)` vs. recursive CTEs
-- Graph algorithms (community detection, shortest path, PageRank) for future retrieval improvements
-- In-memory performance for graph operations
-- Cypher query language is expressive and well-documented
+2. **The model is the best graph engine at this scale.** After Layer 1c (RRF fusion), we have ~30 candidate units. Each has frontmatter with explicit `related: [{id: ..., relation: uses}]` fields. We can hand the model these units plus their relationship metadata and ask "which are relevant?" The model can reason over 30 units with relationship data trivially — this is exactly the kind of work LLMs excel at. Infrastructure complexity for graph traversal is a bet against rapidly improving model capabilities.
 
-**Why Memgraph over Neo4j:**
+3. **Defining the graph is the hard part, not traversing it.** The challenging work is extracting meaningful relationships during capture (the LLM extraction in the write path). Once relationships are in frontmatter `related:` fields, traversing them in SQLite is straightforward — a simple recursive CTE handles 1-3 hops efficiently at our scale.
 
-- Fully open-source (no enterprise-only features needed)
-- Lower resource footprint for single-user workloads
-- Bolt-compatible (same protocol, easy to swap later if needed)
+4. **One fewer runtime dependency.** No Docker container, no Bolt protocol, no sync strategy between two databases, no failure mode to handle when the graph DB is unavailable. SQLite is embedded — the entire derived index is a single file that rebuilds from markdown source of truth.
+
+5. **Measure before adding complexity.** Per the article's guidance: teams should have evals proving that graph expansion improves retrieval quality before adopting graph infrastructure. Build the simpler version first, measure whether graph expansion via SQLite is a bottleneck, and only then consider whether a graph database would help.
+
+**When would a graph database make sense?** If the brain grows to a scale where:
+- SQLite recursive CTEs become measurably slow (unlikely below 100K units)
+- Real-time multi-hop traversal latency matters (Nugget's retrieval is not latency-critical — it's a background MCP call)
+- Graph algorithms (PageRank, community detection) demonstrably improve retrieval quality (measure first)
+
+**Graph expansion implementation:** SQLite recursive CTEs for 1-3 hop traversal:
+
+```sql
+WITH RECURSIVE related_units(id, depth) AS (
+    SELECT target_id, 1 FROM relationships WHERE source_id = ?
+    UNION
+    SELECT r.target_id, ru.depth + 1
+    FROM relationships r JOIN related_units ru ON r.source_id = ru.id
+    WHERE ru.depth < 3
+)
+SELECT DISTINCT id FROM related_units;
+```
+
+This is simple, fast at our scale, and doesn't require a separate database process.
 
 **Why not Mem0 (the product):**
 
 - Mem0 bundles graph construction + storage + retrieval with LLM extraction on every read/write — adds 3 runtime dependencies (LLM API, vector DB, graph DB) and API costs
 - Nugget's 3-layer pipeline (BM25 + embeddings + LLM re-ranking) is more sophisticated than Mem0's retrieval
-- For other users, "install Rust binary + Memgraph" is simpler than "set up Neo4j + Qdrant + OpenAI API key"
+- For other users, "install Rust binary" is simpler than "set up Neo4j + Qdrant + OpenAI API key"
 - The graph enrichment idea from Mem0 is valuable — we adopt it at write time (LLM extracts relationships during capture, writes them to frontmatter `related:` fields) without the runtime dependency
 
-**Sync strategy**: The `nugget-index` crate syncs frontmatter relationships to Memgraph during index build/rebuild. Incremental updates on single-file reindex. On file deletion, the corresponding unit node and all its edges are removed from Memgraph (preventing orphaned nodes).
-
-**Failure handling**: If Memgraph is unavailable or sync fails, the index build logs a warning and proceeds with SQLite-only indexing. Retrieval degrades gracefully — layers 1 and 3 still work, layer 2 (graph expansion) is skipped. This is acceptable because graph expansion is additive; the core search pipeline functions without it. On next successful Memgraph connection, a full rebuild re-syncs the graph.
-
-**Rebuild**: Like SQLite, the Memgraph graph is derived from markdown files and can be rebuilt from scratch. There is no drift detection between SQLite and Memgraph — if they diverge (e.g., after a partial sync failure), `nugget rebuild` re-derives both from the markdown source of truth.
+**Rebuild**: The SQLite database (including relationships) is derived from markdown files and can be rebuilt from scratch. `nugget rebuild` re-derives everything from the markdown source of truth.
 
 **References:**
 
-- [Memgraph documentation](https://memgraph.com/docs)
-- [Memgraph GitHub](https://github.com/memgraph/memgraph)
-- [Mem0 Graph Memory architecture](https://docs.mem0.ai/open-source/features/graph-memory) — informed the graph enrichment approach
+- [You Don't Need a Graph DB (Probably) — Hamel Husain / Jo Kristian Bergum](https://hamel.dev/notes/llm/rag/p7-graph-db.html) — primary inspiration for this decision
+- [Mem0 Graph Memory architecture](https://docs.mem0.ai/open-source/features/graph-memory) — informed the graph enrichment approach (adopted at write time only)
 - [Mem0 paper (arxiv)](https://arxiv.org/html/2504.19413v1) — dual retrieval (entity-centric + semantic triplet) informed Layer 2 design
 - [Graph-based Agent Memory taxonomy](https://arxiv.org/html/2602.05665) — survey of graph memory approaches
 
