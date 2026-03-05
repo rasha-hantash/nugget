@@ -64,6 +64,12 @@ brain/
 
 **KnowledgeUnit.kind vs "type"**: The Rust field is `kind` but serializes as `type` via `#[serde(rename = "type")]` since `type` is a reserved keyword.
 
-## Product Decisions
+## Planning & Decisions
 
-Key decisions are documented in `PRODUCT-DECISIONS.md` and `DECISIONS.MD`. The implementation roadmap is in `IMPLEMENTATIONS.MD`. These docs are the authoritative source for architectural questions — consult them before proposing alternatives to settled decisions.
+The active plan is in `PLAN.md` — read it before starting work. It covers:
+
+- How nugget relates to brain-os hooks (which handle basic capture/retrieval now)
+- Phase 1-4 build order with verification criteria
+- Migration path from brain-os hooks to nugget
+
+Archived planning docs (historical context, not authoritative) are in `archive-decisions/`.
