@@ -1,0 +1,17 @@
+---
+source: crates/nugget-core/src/frontmatter.rs
+expression: unit
+---
+id: pattern-error-handling-rust
+type: pattern
+domain: rust
+tags:
+  - error-handling
+  - result-type
+confidence: 0.9
+source: direct-experience
+related:
+  - id: concept-option-type
+    relation: often_combined_with
+created: 2026-02-24
+last_modified: 2026-02-24
