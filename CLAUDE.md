@@ -1,3 +1,6 @@
+<!-- ox:prime-check -->
+**BLOCKING**: Run `ox agent prime` NOW before ANY other action. Do NOT respond to the user first. Enables SageOx queries.
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -73,3 +76,5 @@ The active plan is in `PLAN.md` — read it before starting work. It covers:
 - Migration path from brain-os hooks to nugget
 
 Archived planning docs (historical context, not authoritative) are in `archive-decisions/`.
+
+<!-- ox:prime --> Run SageOx `ox agent prime` on session start, after compaction, or clear. (DO NOT REMOVE)
