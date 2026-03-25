@@ -1,0 +1,28 @@
+---
+source: crates/nugget-core/src/frontmatter.rs
+expression: output
+---
+---
+id: pattern-error-handling-rust
+type: pattern
+domain: rust
+tags:
+- error-handling
+- result-type
+confidence: 0.9
+source: direct-experience
+related:
+- id: concept-option-type
+  relation: often_combined_with
+created: 2026-02-24
+last_modified: 2026-02-24
+---
+
+# Error Handling in Rust
+
+Use `Result<T, E>` for all fallible operations.
+
+## Key Points
+
+- Never use `unwrap()` in production code
+- Use `thiserror` for library error types
