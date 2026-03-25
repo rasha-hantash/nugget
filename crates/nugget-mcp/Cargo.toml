@@ -1,0 +1,20 @@
+[package]
+name = "nugget-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nugget-core = { path = "../nugget-core" }
+nugget-store = { path = "../nugget-store" }
+nugget-inbox = { path = "../nugget-inbox" }
+nugget-capture = { path = "../nugget-capture" }
+rmcp = { version = "0.1", features = ["server", "transport-io"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+schemars = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
