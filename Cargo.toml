@@ -5,6 +5,7 @@ members = [
     "crates/nugget-inbox",
     "crates/nugget-capture",
     "crates/nugget-mcp",
+    "crates/nugget-import",
     "crates/nugget-cli",
 ]
 resolver = "2"

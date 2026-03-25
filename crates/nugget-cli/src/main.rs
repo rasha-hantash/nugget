@@ -48,8 +48,23 @@ enum Commands {
     /// Interactive one-by-one inbox review
     Review,
 
+    /// Import knowledge from external sources
+    Import {
+        #[command(subcommand)]
+        command: ImportCommands,
+    },
+
     /// Start MCP server (stdio transport for Claude Code)
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum ImportCommands {
+    /// Import from a Notion export directory
+    Notion {
+        /// Path to the unzipped Notion export directory
+        export_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,6 +137,9 @@ fn main() -> Result<()> {
         Commands::Accept { indices } => cmd_accept(&store, &indices),
         Commands::Reject { indices } => cmd_reject(&store, &indices),
         Commands::Review => cmd_review(&store),
+        Commands::Import { command } => match command {
+            ImportCommands::Notion { export_dir } => cmd_import_notion(&store, &export_dir),
+        },
         Commands::Mcp => cmd_mcp(&store),
     }
 }
@@ -193,6 +211,21 @@ fn cmd_reject(store: &BrainStore, indices: &[usize]) -> Result<()> {
     let inbox = Inbox::new(store.clone());
     inbox.reject_by_indices(indices)?;
     println!("Rejected {} item(s).", indices.len());
+    Ok(())
+}
+
+fn cmd_import_notion(store: &BrainStore, export_dir: &Path) -> Result<()> {
+    if !store.is_initialized() {
+        bail!("brain not initialized — run `nugget init` first");
+    }
+    let summary = nugget_import::import_notion(store, export_dir)?;
+    println!(
+        "Imported {} item(s), skipped {} file(s).",
+        summary.imported, summary.skipped
+    );
+    if summary.imported > 0 {
+        println!("Run `nugget inbox` to see imported items, or `nugget review` to review them.");
+    }
     Ok(())
 }
 

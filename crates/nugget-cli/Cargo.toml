@@ -12,6 +12,7 @@ nugget-core = { path = "../nugget-core" }
 nugget-store = { path = "../nugget-store" }
 nugget-inbox = { path = "../nugget-inbox" }
 nugget-mcp = { path = "../nugget-mcp" }
+nugget-import = { path = "../nugget-import" }
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
 tokio = { workspace = true }
